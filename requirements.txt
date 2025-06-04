@@ -1,5 +1,6 @@
-numpy 
-matplotlib 
+numpy
+matplotlib
 scipy
 datetime
 bpy
+spiceypy

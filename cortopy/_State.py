@@ -24,6 +24,8 @@ class State:
         geometry: str = None,
         body: Union[str, list] = None,
         scenario: str = None,
+        spice_time: str = None,
+        kernels: List[str] | None = None,
     ) -> None:
         """
         Constructor for the class STATE defining scene parameters
@@ -32,6 +34,8 @@ class State:
             scene (str): path to json file with scene settings
             geometry (str): path to json file with geometry settings
             body (str or list): path to file with body .blend model
+            spice_time (str, optional): time string used to query SPICE kernels
+            kernels (list, optional): list of SPICE kernel paths to load
         """
         # Generate a single/multiple nd n_bodies
         if isinstance(body, str):
@@ -67,6 +71,30 @@ class State:
         self.add_path("corto_path", corto_path)
         self.add_path("input_path", os.path.join(corto_path, "input", scenario))
         self.add_path("output_path", os.path.join(corto_path, "output", scenario))
+
+        # SPICE geometry
+        self.spice_time = spice_time
+        self.kernels = kernels
+        if self.spice_time and self.kernels:
+            import spiceypy as spice
+            from . import _Spice
+
+            _Spice.load_kernels(self.kernels)
+            et = spice.utc2et(self.spice_time)
+
+            def _update_pose(item: dict):
+                if item and {'target', 'observer', 'frame'} <= item.keys():
+                    pos, quat = _Spice.get_pose(item['target'], item['observer'], item['frame'], et)
+                    item['position'] = np.array([pos])
+                    item['orientation'] = np.array([quat])
+
+            _update_pose(self.geometry.get('camera'))
+            if self.n_bodies == 1:
+                _update_pose(self.geometry.get('body'))
+            else:
+                for ii in range(self.n_bodies):
+                    _update_pose(self.geometry.get(f'body_{ii+1}'))
+            _update_pose(self.geometry.get('sun'))
 
     def import_geometry(self, geometry: str) -> None:
         """
