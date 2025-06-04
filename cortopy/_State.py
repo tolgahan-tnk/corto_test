@@ -46,7 +46,7 @@ class State:
             TypeError("You have used a list to specify a single body")
 
         # Get the directory where the script is located
-        corto_path = Path("__file__").resolve().parent
+        corto_path = Path(__file__).resolve().parent
         print(f"Script is running in: {corto_path}")
 
         scene_file = os.path.join("input", scenario, "scene", scene)

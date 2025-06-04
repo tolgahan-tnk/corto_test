@@ -18,10 +18,10 @@ __all__ = (
     "Sun",
     "State",
     "Environment",
-    "Rendering"
+    "Rendering",
     "PostPro",
     "Shading",
-    "Compositing"
+    "Compositing",
     "Spice"
 )
 
