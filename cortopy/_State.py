@@ -45,19 +45,19 @@ class State:
         else:
             TypeError("You have used a list to specify a single body")
 
-        # Get the directory where the script is located
-        corto_path = Path(__file__).resolve().parent
+        # Get the repository root directory
+        corto_path = Path(__file__).resolve().parent.parent
         print(f"Script is running in: {corto_path}")
 
-        scene_file = os.path.join("input", scenario, "scene", scene)
-        geometry_file = os.path.join("input", scenario, "geometry", geometry)
+        scene_file = os.path.join(corto_path, "input", scenario, "scene", scene)
+        geometry_file = os.path.join(corto_path, "input", scenario, "geometry", geometry)
         # body_file_according to single or multiple bodies
         if self.n_bodies == 1:
-            body_file = os.path.join("input", scenario, "body", "shape", body)
+            body_file = os.path.join(corto_path, "input", scenario, "body", "shape", body)
         else: #n_bodies>1
             body_file = []
             for ii in range(0,self.n_bodies):
-                body_file.append(os.path.join("input", scenario, "body", "shape", body[ii]))
+                body_file.append(os.path.join(corto_path, "input", scenario, "body", "shape", body[ii]))
 
         # Import inputs
         self.import_scene(scene_file)
