@@ -74,8 +74,12 @@ class State:
 
         # SPICE geometry
         self.spice_time = spice_time
-        self.kernels = kernels
-        if self.spice_time and self.kernels:
+        self.kernels = None
+        if spice_time and kernels:
+            self.kernels = [
+                k if os.path.isabs(k) else os.path.join(corto_path, k)
+                for k in kernels
+            ]
             import spiceypy as spice
             from . import _Spice
 
