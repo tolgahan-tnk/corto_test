@@ -92,8 +92,15 @@ This should allow the installation to complete if all compatibility requirements
 
 6) You should see images and labels generated in an output folder
 
-# How to run your own script 
+# How to run your own script
 To shape your own scenario, you can imitate the ones provided in the tutorials. In case you are happy with one of the scenarios, you can always change the inputs and or the tutorial script. Otherwise, if you want to use this library for a different target, you can also imitate how the tutorials script build on it.
+
+## Rendering a Phobos HRSC image
+See `scripts/render_phobos_hrsc.py` for an example that downloads SPICE kernels
+and renders a single HRSC-like view of Phobos using real geometry at
+``2018-08-02T08:48:03.686``. The script expects the `S07_Mars_Phobos_Deimos`
+scenario with ``scene.json`` and ``geometry.json`` available under the
+``input`` folder.
 
 # Changelog
 
