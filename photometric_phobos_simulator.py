@@ -5,6 +5,16 @@ Based on S07_Mars_Phobos_Deimos.py with SPICE integration
 and user-provided file structure.
 """
 
+"""
+photometric_phobos_simulator.py (UPDATED WITH SRC CAMERA SUPPORT)
+Photometrically Accurate Phobos Simulation with Dynamic SPICE Data and HRSC SRC Camera
+"""
+
+"""
+photometric_phobos_simulator.py (UPDATED WITH SRC CAMERA SUPPORT)
+Photometrically Accurate Phobos Simulation with Dynamic SPICE Data and HRSC SRC Camera
+"""
+
 import sys
 import os
 import json
@@ -15,46 +25,52 @@ from datetime import datetime
 from skimage.metrics import structural_similarity as ssim
 from scipy.signal import correlate2d
 
-# Proje ana dizinini Python yoluna ekleyin
-# Bu, betiğin diğer modülleri bulmasını sağlar
+# Add current directory to Python path
 sys.path.append(os.getcwd())
 
-# Diğer modülleri içe aktarın
-# Bu dosyaların ana betikle aynı dizinde veya Python yolunda olduğundan emin olun
+# Import other modules
 try:
     from spice_data_processor import SpiceDataProcessor
     import cortopy as corto
 except ImportError as e:
-    print(f"Hata: Gerekli modüller bulunamadı. Lütfen 'cortopy' ve 'spice_data_processor.py' dosyalarının doğru konumda olduğundan emin olun. Detay: {e}")
+    print(f"Hata: Gerekli modüller bulunamadı. Detay: {e}")
     sys.exit(1)
 
 
 class PhotometricPhobosSimulator:
-    """Photometrically accurate Phobos simulation with SPICE integration."""
+    """Photometrically accurate Phobos simulation with SPICE integration and SRC camera support."""
 
-    def __init__(self, config_path=None):
-        # Eğer bir config dosyası verilmezse, _create_default_config ile varsayılanı kullanır
+    def __init__(self, config_path=None, camera_type='SRC'):
         self.config = self._load_config(config_path)
+        self.camera_type = camera_type
         
-        # SPICE işlemcisini, config'de belirtilen yolla başlat
+        # Initialize SPICE processor with enhanced capabilities
         self.spice_processor = SpiceDataProcessor(base_path=self.config['spice_data_path'])
         
         self.scenario_name = "S07_Mars_Phobos_Deimos"
 
-        # Fotometrik parametreler (optimizasyon için kolayca ayarlanabilir)
+        # Get camera configuration from IK kernel
+        self.camera_config = self.spice_processor.get_hrsc_camera_config(camera_type)
+        print(f"Using {camera_type} camera configuration:")
+        print(f"  FOV: {self.camera_config['fov']:.3f}°")
+        print(f"  Resolution: {self.camera_config['res_x']}x{self.camera_config['res_y']}")
+        print(f"  Focal Length: {self.camera_config['focal_length_mm']:.1f} mm")
+        print(f"  IFOV: {self.camera_config['ifov_rad']*206265:.3f} arcsec/pixel")
+
+        # Photometric parameters optimized for SRC camera
         self.photometric_params = {
-            'sun_strength': 589.0,         # Mars yörüngesi için Güneş gücü [W/m²]
-            'phobos_albedo': 0.068,        # Phobos albedosu (doğru ölçekli)
-            'mars_albedo': 0.170,          # Mars albedosu
-            'deimos_albedo': 0.068,        # Deimos albedosu
-            'sensor_aging_factor': 0.95,   # Sensör yaşlanma çarpanı (örn. 2025 için %5 azalma)
-            'brdf_model': 'principled',    # 'principled' (varsayılan) veya 'hapke_osl'
-            'brdf_roughness': 0.5,         # Yüzey pürüzlülüğü (Oren-Nayar/Principled için)
-            'gamma_correction': 2.2,       # Görüntü gama değeri
-            'exposure_time': 0.039,        # Pozlama süresi [s] (PDS etiketinden)
+            'sun_strength': 589.0,
+            'phobos_albedo': 0.068,
+            'mars_albedo': 0.170,
+            'deimos_albedo': 0.068,
+            'sensor_aging_factor': 0.95,
+            'brdf_model': 'principled',
+            'brdf_roughness': 0.5,
+            'gamma_correction': 2.2,
+            'exposure_time': self.camera_config['film_exposure'],
         }
 
-        # Gürültü modeli parametreleri (CORTO makalesi Figür 8'e göre)
+        # Noise model parameters
         self.noise_params = {
             'gaussian_mean': 0.0,
             'gaussian_variance': 0.001,
@@ -63,7 +79,7 @@ class PhotometricPhobosSimulator:
             'radiation_line_probability': 0.001,
         }
 
-        # Validasyon parametreleri
+        # Validation parameters
         self.validation_params = {
             'ssim_threshold': 0.98,
             'rmse_threshold': 0.05,
@@ -71,7 +87,7 @@ class PhotometricPhobosSimulator:
         }
 
     def _load_config(self, config_path):
-        """Yapılandırmayı JSON dosyasından yükler veya varsayılanı oluşturur."""
+        """Load configuration from JSON file or create default."""
         if config_path and Path(config_path).exists():
             with open(config_path, 'r') as f:
                 return json.load(f)
@@ -80,46 +96,41 @@ class PhotometricPhobosSimulator:
             return self._create_default_config()
 
     def _create_default_config(self):
-        """
-        Kullanıcının sağladığı dosya yapısına göre varsayılan yapılandırmayı oluşturur.
-        """
-        # Ana betiğin çalıştığı dizini temel alarak göreli yolları oluştur
+        """Create default configuration based on user's file structure."""
         base_dir = Path(os.getcwd())
 
         return {
             'input_path': str(base_dir / "input" / "S07_Mars_Phobos_Deimos"),
             'output_path': str(base_dir / 'output' / 'photometric_validation'),
-            'spice_data_path': str(base_dir / 'spice_kernels'), # SPICE kernelleri için dizin
-            'real_images_path': str(base_dir / 'real_hrsc_images'), # Karşılaştırma için gerçek görüntüler
+            'spice_data_path': str(base_dir / 'spice_kernels'),
+            'real_images_path': str(base_dir / 'real_hrsc_images'),
 
-            # Kullanıcının belirttiği OBJ dosyaları
             'body_files': [
                 'g_phobos_287m_spc_0000n00000_v002.obj',
                 'Mars_65k.obj',
                 'g_deimos_162m_spc_0000n00000_v001.obj'
             ],
             
-            # CORTO sahne ve geometri dosyaları
             'scene_file': 'scene_mmx.json',
             'geometry_file': 'geometry_mmx.json'
         }
 
     def setup_photometric_scene(self, utc_time):
-        """Fotometrik olarak doğru sahneyi kurar."""
+        """Set up photometrically correct scene with SRC camera parameters."""
         print(f"Fotometrik sahne kuruluyor: {utc_time}")
         
-        # Önceki render'lardan kalanları temizle
+        # Clean previous renders
         corto.Utils.clean_scene()
         
-        # Verilen UTC zamanı için SPICE verilerini çek
+        # Get SPICE data for the given UTC time
         spice_data = self.spice_processor.get_spice_data(utc_time)
         
-        # SPICE verilerini CORTO uyumlu bir geometri dosyasına yaz
+        # Write SPICE data to CORTO-compatible geometry file
         output_dir = Path(self.config['output_path'])
         output_dir.mkdir(parents=True, exist_ok=True)
         dynamic_geometry_path = output_dir / 'geometry_dynamic.json'
         
-        # CORTO geometry formatına dönüştür
+        # Convert to CORTO geometry format
         geometry_data = {
             "sun": {
                 "position": [spice_data["sun"]["position"]]
@@ -144,45 +155,92 @@ class PhotometricPhobosSimulator:
         
         with open(dynamic_geometry_path, 'w') as f:
             json.dump(geometry_data, f, indent=4)
+        
+        # Create updated scene configuration with SRC camera parameters
+        scene_config = self._create_scene_config()
+        scene_config_path = output_dir / 'scene_src.json'
+        
+        with open(scene_config_path, 'w') as f:
+            json.dump(scene_config, f, indent=4)
             
-        # CORTO State nesnesini doğru parametrelerle başlat
+        # Create CORTO State object
         state = corto.State(
-            scene=self.config['scene_file'],
-            geometry=str(dynamic_geometry_path), # Dinamik olarak oluşturulan dosya
+            scene=str(scene_config_path),
+            geometry=str(dynamic_geometry_path),
             body=self.config['body_files'],
             scenario=self.scenario_name
         )
         
-        # Albedo ve UV haritaları için yolları ekle
+        # Add photometric paths
         self._add_photometric_paths(state)
         
         return state, spice_data
 
+    def _create_scene_config(self):
+        """Create scene configuration with SRC camera parameters."""
+        scene_config = {
+            "camera_settings": {
+                "fov": self.camera_config['fov'],
+                "res_x": self.camera_config['res_x'],
+                "res_y": self.camera_config['res_y'],
+                "film_exposure": self.camera_config['film_exposure'],
+                "sensor": self.camera_config['sensor'],
+                "K": self.camera_config['K'],
+                "clip_start": self.camera_config['clip_start'],
+                "clip_end": self.camera_config['clip_end'],
+                "bit_encoding": self.camera_config['bit_encoding'],
+                "viewtransform": self.camera_config['viewtransform']
+            },
+            "sun_settings": {
+                "angle": 0.00927,  # Sun angular size as seen from Mars
+                "energy": self.photometric_params['sun_strength']
+            },
+            "body_settings_1": {  # Phobos
+                "pass_index": 1,
+                "diffuse_bounces": 4
+            },
+            "body_settings_2": {  # Mars
+                "pass_index": 2,
+                "diffuse_bounces": 4
+            },
+            "body_settings_3": {  # Deimos
+                "pass_index": 3,
+                "diffuse_bounces": 4
+            },
+            "rendering_settings": {
+                "engine": "CYCLES",
+                "device": "CPU",
+                "samples": 256,
+                "preview_samples": 16
+            }
+        }
+        return scene_config
+
     def _add_photometric_paths(self, state):
-        """Fotometrik haritaların yollarını State nesnesine ekler."""
-        # Albedo haritaları
+        """Add photometric maps paths to State object."""
+        # Albedo maps
         state.add_path('albedo_path_1', os.path.join(state.path["input_path"], 'body', 'albedo', 'Phobos grayscale.jpg'))
         state.add_path('albedo_path_2', os.path.join(state.path["input_path"], 'body', 'albedo', 'mars_1k_color.jpg'))
         state.add_path('albedo_path_3', os.path.join(state.path["input_path"], 'body', 'albedo', 'Deimos grayscale.jpg'))
 
-        # UV Veri Dosyaları (isimlerin body_files ile eşleştiğinden emin olun)
+        # UV Data Files
         state.add_path('uv_data_path_1', os.path.join(state.path["input_path"], 'body', 'uv data', 'g_phobos_287m_spc_0000n00000_v002.json'))
         state.add_path('uv_data_path_2', os.path.join(state.path["input_path"], 'body', 'uv data', 'Mars_65k.json'))
         state.add_path('uv_data_path_3', os.path.join(state.path["input_path"], 'body', 'uv data', 'g_deimos_162m_spc_0000n00000_v001.json'))
 
     def create_photometric_environment(self, state):
-        """Fotometrik olarak kalibre edilmiş ortamı oluşturur."""
-        # Kamera ayarları
+        """Create photometrically calibrated environment with SRC camera."""
+        # Camera settings (now using SRC parameters)
         cam_props = state.properties_cam.copy()
         cam_props['film_exposure'] = self.photometric_params['exposure_time']
-        cam = corto.Camera('HRSC_Camera', cam_props)
+        cam = corto.Camera(f'HRSC_{self.camera_type}_Camera', cam_props)
         
-        # Güneş ayarları
+        # Sun settings
         sun_props = state.properties_sun.copy()
         sun_props['energy'] = self.photometric_params['sun_strength']
         sun = corto.Sun('Sun', sun_props)
         
-        # Cisimleri oluştur
+        # Create bodies
         bodies = []
         body_names = [Path(bf).stem for bf in self.config['body_files']]
         
@@ -191,9 +249,9 @@ class PhotometricPhobosSimulator:
             body = corto.Body(body_name, body_props)
             bodies.append(body)
         
-        # Render ayarları
+        # Rendering settings optimized for SRC camera
         rendering_props = state.properties_rendering.copy()
-        rendering_props['samples'] = 256 # Fotometrik doğruluk için daha yüksek örnek sayısı
+        rendering_props['samples'] = 256  # High quality for photometric accuracy
         rendering = corto.Rendering(rendering_props)
         
         env = corto.Environment(cam, bodies, sun, rendering)
@@ -248,9 +306,8 @@ class PhotometricPhobosSimulator:
         return tree
 
     def apply_noise_model(self, image_array, noise_combination=None):
-        """Apply CORTO noise model (Figure 8) to synthetic image"""
+        """Apply CORTO noise model to synthetic image"""
         if noise_combination is None:
-            # Use default noise combination
             noise_combination = [0.01, 1e-4, 1.0, 1.17]
 
         gaussian_mean, gaussian_var, blur_factor, brightness = noise_combination
@@ -318,7 +375,7 @@ class PhotometricPhobosSimulator:
         real_image = real_image.astype(np.float32) / 255.0
         synthetic_image = synthetic_image.astype(np.float32)
 
-        # 1. Normalized Cross Correlation (NCC) for alignment
+        # 1. Normalized Cross Correlation (NCC)
         ncc = correlate2d(real_image, synthetic_image, mode='valid')
         max_ncc = np.max(ncc)
 
@@ -353,7 +410,7 @@ class PhotometricPhobosSimulator:
         return validation_results
 
     def run_photometric_simulation(self, utc_time, real_image_path=None):
-        """Run complete photometric simulation"""
+        """Run complete photometric simulation with SRC camera"""
         print(f"Starting photometric simulation for {utc_time}")
 
         # Setup scene
@@ -366,10 +423,10 @@ class PhotometricPhobosSimulator:
         # Setup compositing
         tree = self.setup_photometric_compositing(state)
 
-        # Scale bodies appropriately
-        bodies[0].set_scale(np.array([1.0, 1.0, 1.0]))  # Phobos
+        # Scale bodies appropriately for SRC camera viewing
+        bodies[0].set_scale(np.array([1.0, 1.0, 1.0]))      # Phobos
         bodies[1].set_scale(np.array([1000.0, 1000.0, 1000.0]))  # Mars
-        bodies[2].set_scale(np.array([1.0, 1.0, 1.0]))  # Deimos
+        bodies[2].set_scale(np.array([1.0, 1.0, 1.0]))      # Deimos
 
         # Position all objects
         env.PositionAll(state, index=0)
@@ -379,12 +436,10 @@ class PhotometricPhobosSimulator:
 
         # Validate if real image provided
         if real_image_path:
-            # Note: You would need to extract the synthetic image from the rendered output
-            # This is a placeholder for the validation logic
             print("Validation with real image would be performed here")
 
         # Save results
-        corto.Utils.save_blend(state)
+        corto.Utils.save_blend(state, 'initial_debug')
 
         return state, spice_data
 
@@ -392,6 +447,8 @@ class PhotometricPhobosSimulator:
         """Create comprehensive validation report"""
         report = {
             'timestamp': datetime.now().isoformat(),
+            'camera_type': self.camera_type,
+            'camera_config': self.camera_config,
             'photometric_parameters': self.photometric_params,
             'validation_results': validation_results_list,
             'summary': {
@@ -409,16 +466,67 @@ class PhotometricPhobosSimulator:
 
         return report
 
+    def save_camera_report(self):
+        """Save detailed camera configuration report"""
+        report_path = os.path.join(self.config['output_path'], f'camera_config_{self.camera_type}.json')
+        
+        # Get additional camera parameters from IK kernel
+        camera_params = self.spice_processor._get_camera_parameters(f'HRSC_{self.camera_type}')
+        
+        full_report = {
+            'camera_type': self.camera_type,
+            'timestamp': datetime.now().isoformat(),
+            'corto_config': self.camera_config,
+            'ik_parameters': camera_params,
+            'photometric_params': self.photometric_params
+        }
+        
+        # Convert numpy types to JSON-serializable types
+        def convert_numpy_types(obj):
+            """Convert numpy types to Python native types for JSON serialization"""
+            if isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, dict):
+                return {key: convert_numpy_types(value) for key, value in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_numpy_types(item) for item in obj]
+            return obj
+            
+        full_report_safe = convert_numpy_types(full_report)
+        
+        with open(report_path, 'w') as f:
+            json.dump(full_report_safe, f, indent=4)
+        
+        print(f"Camera configuration report saved to {report_path}")
+
 # Usage example
 if __name__ == "__main__":
+    # Test with both SRC and main HRSC camera
+    camera_types = ['SRC', 'HEAD']
+    
     # Example UTC times from HRSC observations
     utc_times = [
         "2019-06-07T10:46:42.8575Z",
         "2018-08-02T08:48:03.6855Z"
     ]
 
-    simulator = PhotometricPhobosSimulator()
+    for camera_type in camera_types:
+        print(f"\n{'='*60}")
+        print(f"Testing with {camera_type} camera")
+        print(f"{'='*60}")
+        
+        simulator = PhotometricPhobosSimulator(camera_type=camera_type)
+        
+        # Save camera configuration report
+        simulator.save_camera_report()
 
-    for utc_time in utc_times:
-        state, spice_data = simulator.run_photometric_simulation(utc_time)
-        print(f"Completed simulation for {utc_time}")
+        for utc_time in utc_times:
+            try:
+                state, spice_data = simulator.run_photometric_simulation(utc_time)
+                print(f"✅ Completed simulation for {utc_time} with {camera_type} camera")
+            except Exception as e:
+                print(f"❌ Error in simulation for {utc_time}: {e}")
