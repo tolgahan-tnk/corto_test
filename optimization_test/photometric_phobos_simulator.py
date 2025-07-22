@@ -1,7 +1,7 @@
 """
-photometric_phobos_simulator.py (FIXED VERSION)
-Photometrically Accurate Phobos Simulation with Dynamic SPICE Data and HRSC SRC Camera
-Fixed JSON serialization and camera matrix issues
+enhanced_photometric_phobos_simulator.py
+Enhanced Photometric Phobos Simulation with PDS Integration and CORTO Validation
+Integrates PDS_reader.py for real IMG data processing and implements full CORTO validation pipeline
 """
 
 import sys
@@ -13,6 +13,11 @@ from pathlib import Path
 from datetime import datetime
 from skimage.metrics import structural_similarity as ssim
 from scipy.signal import correlate2d
+import pandas as pd
+import requests
+import re
+import time
+import pickle
 
 # Add current directory to Python path
 sys.path.append(os.getcwd())
@@ -20,9 +25,10 @@ sys.path.append(os.getcwd())
 # Import other modules
 try:
     from spice_data_processor import SpiceDataProcessor
+    from corto_post_processor import CORTOPostProcessor
     import cortopy as corto
 except ImportError as e:
-    print(f"Hata: Gerekli modüller bulunamadı. Detay: {e}")
+    print(f"Error: Required modules not found. Details: {e}")
     sys.exit(1)
 
 
@@ -41,33 +47,221 @@ def convert_numpy_types(obj):
     return obj
 
 
-class PhotometricPhobosSimulator:
-    """Photometrically accurate Phobos simulation with SPICE integration and SRC camera support."""
+class PDSImageProcessor:
+    """Process PDS IMG files and extract UTC_MEAN_TIME information"""
+    
+    def __init__(self, pds_data_path="PDS_Data"):
+        self.pds_data_path = Path(pds_data_path)
+        self._key_val = re.compile(r"^\s*([A-Za-z0-9_]+)\s*=\s*(.*)$")
+        
+    def parse_pds_label(self, file_path, max_records=50_000):
+        """Parse PDS label from IMG file"""
+        label = {}
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as fh:
+            for i, raw in enumerate(fh):
+                if i > max_records:
+                    break
+                line = raw.strip().replace("<CR><LF>", "")
+                if line.upper().startswith("END"):
+                    break
+                m = self._key_val.match(line)
+                if m:
+                    key, val = m.groups()
+                    val = val.strip().strip('"').strip("'")
+                    label[key] = val
+        return label
+    
+    def process_img_directory(self, img_directory_path):
+        """Process all IMG files in directory and create UTC database"""
+        records = []
+        img_dir = Path(img_directory_path)
+        
+        print(f"Processing IMG files in: {img_dir}")
+        
+        for img_file in img_dir.rglob("*.IMG"):
+            try:
+                label = self.parse_pds_label(img_file)
+                label.update({"file_path": str(img_file), "file_name": img_file.name})
+                records.append(label)
+                print(f"Processed: {img_file.name}")
+            except Exception as e:
+                print(f"Error processing {img_file.name}: {e}")
+                
+        if not records:
+            raise RuntimeError("No IMG files found or processed!")
+            
+        df = pd.DataFrame(records)
+        print(f"IMG files processed: {len(df)}")
+        
+        # Process time columns - ensure timezone-naive datetimes
+        for col in ["START_TIME", "STOP_TIME"]:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce", utc=True)
+                # Convert to timezone-naive for Excel compatibility
+                df[col] = df[col].dt.tz_localize(None)
+        
+        if {"START_TIME", "STOP_TIME"} <= set(df.columns):
+            df["DURATION_SECONDS"] = (df["STOP_TIME"] - df["START_TIME"]).dt.total_seconds()
+            df["MEAN_TIME"] = df["START_TIME"] + (df["STOP_TIME"] - df["START_TIME"]) / 2
+            df["UTC_MEAN_TIME"] = (
+                df["MEAN_TIME"]
+                  .dt.strftime("%Y-%m-%dT%H:%M:%S.%f")
+                  .str[:-2] + "Z"
+            )
+        else:
+            df["DURATION_SECONDS"] = pd.NA
+            df["MEAN_TIME"] = pd.NaT
+            df["UTC_MEAN_TIME"] = pd.NA
+            
+        df["STATUS"] = (
+            df["START_TIME"].notna() & df["STOP_TIME"].notna()
+        ).map({True: "SUCCESS", False: "MISSING_TIME_DATA"})
+        
+        return df
 
-    def __init__(self, config_path=None, camera_type='SRC'):
+
+class CORTOValidator:
+    """CORTO validation pipeline implementation"""
+    
+    def __init__(self):
+        self.validation_results = []
+        
+    def normalized_cross_correlation(self, template, image):
+        """Compute normalized cross-correlation"""
+        template_norm = (template - np.mean(template)) / np.std(template)
+        image_norm = (image - np.mean(image)) / np.std(image)
+        correlation = correlate2d(image_norm, template_norm, mode='valid')
+        return np.max(correlation) / (template.size)
+    
+    def compute_nrmse(self, real_img, synthetic_img):
+        """Compute Normalized Root Mean Square Error"""
+        if real_img.shape != synthetic_img.shape:
+            synthetic_img = cv2.resize(synthetic_img, (real_img.shape[1], real_img.shape[0]))
+        
+        mse = np.mean((real_img.astype(float) - synthetic_img.astype(float)) ** 2)
+        nrmse = np.sqrt(mse) / (np.max(real_img) - np.min(real_img))
+        return nrmse
+    
+    def compute_ssim(self, real_img, synthetic_img):
+        """Compute Structural Similarity Index Measure"""
+        if real_img.shape != synthetic_img.shape:
+            synthetic_img = cv2.resize(synthetic_img, (real_img.shape[1], real_img.shape[0]))
+        
+        # Convert to grayscale if needed
+        if len(real_img.shape) == 3:
+            real_img = cv2.cvtColor(real_img, cv2.COLOR_BGR2GRAY)
+        if len(synthetic_img.shape) == 3:
+            synthetic_img = cv2.cvtColor(synthetic_img, cv2.COLOR_BGR2GRAY)
+            
+        return ssim(real_img, synthetic_img, data_range=255)
+    
+    def validate_image_pair(self, real_img_path, synthetic_img_path, utc_time, img_filename):
+        """Validate real vs synthetic image pair using CORTO methodology"""
+        try:
+            # Load images
+            real_img = cv2.imread(str(real_img_path), cv2.IMREAD_GRAYSCALE)
+            synthetic_img = cv2.imread(str(synthetic_img_path), cv2.IMREAD_GRAYSCALE)
+            
+            if real_img is None or synthetic_img is None:
+                return None
+            
+            # Compute validation metrics
+            ncc = self.normalized_cross_correlation(real_img, synthetic_img)
+            nrmse = self.compute_nrmse(real_img, synthetic_img)
+            ssim_score = self.compute_ssim(real_img, synthetic_img)
+            
+            validation_result = {
+                'utc_time': utc_time,
+                'img_filename': img_filename,
+                'real_img_path': str(real_img_path),
+                'synthetic_img_path': str(synthetic_img_path),
+                'ncc': float(ncc),
+                'nrmse': float(nrmse),
+                'ssim': float(ssim_score),
+                'timestamp': datetime.now().isoformat(),
+                'validation_status': 'SUCCESS' if ssim_score > 0.7 else 'LOW_SIMILARITY'
+            }
+            
+            self.validation_results.append(validation_result)
+            return validation_result
+            
+        except Exception as e:
+            print(f"Error in validation for {img_filename}: {e}")
+            return None
+    
+    def save_validation_results(self, output_path):
+        """Save validation results to JSON and Excel"""
+        output_path = Path(output_path)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Save as JSON
+        json_path = output_path / f"validation_results_{timestamp}.json"
+        with open(json_path, 'w') as f:
+            json.dump(convert_numpy_types(self.validation_results), f, indent=4)
+        
+        # Save as Excel
+        excel_path = None
+        if self.validation_results:
+            df = pd.DataFrame(self.validation_results)
+            
+            # Handle any datetime columns that might have timezone info
+            for col in df.columns:
+                if df[col].dtype == 'datetime64[ns, UTC]' or (hasattr(df[col].dtype, 'tz') and df[col].dtype.tz is not None):
+                    df[col] = pd.to_datetime(df[col]).dt.tz_localize(None)
+            
+            excel_path = output_path / f"validation_results_{timestamp}.xlsx"
+            try:
+                df.to_excel(excel_path, index=False)
+            except Exception as e:
+                print(f"Warning: Could not save Excel file: {e}")
+                # Save as CSV instead
+                csv_path = output_path / f"validation_results_{timestamp}.csv"
+                df.to_csv(csv_path, index=False)
+                excel_path = csv_path
+            
+            # Create summary
+            summary = {
+                'total_validations': len(self.validation_results),
+                'successful_validations': len([r for r in self.validation_results if r['validation_status'] == 'SUCCESS']),
+                'average_ssim': np.mean([r['ssim'] for r in self.validation_results]),
+                'average_nrmse': np.mean([r['nrmse'] for r in self.validation_results]),
+                'average_ncc': np.mean([r['ncc'] for r in self.validation_results])
+            }
+            
+            summary_path = output_path / f"validation_summary_{timestamp}.json"
+            with open(summary_path, 'w') as f:
+                json.dump(convert_numpy_types(summary), f, indent=4)
+                
+        print(f"Validation results saved to: {output_path}")
+        return json_path, excel_path
+
+
+class EnhancedPhotometricPhobosSimulator:
+    """Enhanced Photometric Phobos Simulator with PDS integration and CORTO validation"""
+    
+    def __init__(self, config_path=None, camera_type='SRC', pds_data_path=None):
         self.config = self._load_config(config_path)
         self.camera_type = camera_type
+        self.pds_data_path = pds_data_path or self.config.get('pds_data_path', 'PDS_Data')
         
-        # Initialize SPICE processor with enhanced capabilities
+        # Initialize components
         self.spice_processor = SpiceDataProcessor(base_path=self.config['spice_data_path'])
+        self.pds_processor = PDSImageProcessor(self.pds_data_path)
+        self.post_processor = CORTOPostProcessor(target_size=128)
+        self.validator = CORTOValidator()
         
         self.scenario_name = "S07_Mars_Phobos_Deimos"
-
-        # Get camera configuration from IK kernel with fallback
+        
+        # Get camera configuration
         try:
             self.camera_config = self.spice_processor.get_hrsc_camera_config(camera_type)
         except Exception as e:
             print(f"Warning: Could not get camera config from SPICE: {e}")
             self.camera_config = self._get_fallback_camera_config(camera_type)
             
-        print(f"Using {camera_type} camera configuration:")
-        print(f"  FOV: {self.camera_config['fov']:.3f}°")
-        print(f"  Resolution: {self.camera_config['res_x']}x{self.camera_config['res_y']}")
-        print(f"  Focal Length: {self.camera_config.get('focal_length_mm', 'N/A')} mm")
-        if 'ifov_rad' in self.camera_config:
-            print(f"  IFOV: {self.camera_config['ifov_rad']*206265:.3f} arcsec/pixel")
-
-        # Photometric parameters optimized for SRC camera
+        # Set photometric parameters
         self.photometric_params = {
             'sun_strength': 589.0,
             'phobos_albedo': 0.068,
@@ -79,28 +273,41 @@ class PhotometricPhobosSimulator:
             'gamma_correction': 2.2,
             'exposure_time': self.camera_config['film_exposure'],
         }
-
-        # Noise model parameters
-        self.noise_params = {
-            'gaussian_mean': 0.0,
-            'gaussian_variance': 0.001,
-            'blur_kernel_size': 1.0,
-            'dead_pixel_probability': 0.0001,
-            'radiation_line_probability': 0.001,
+        
+        print(f"Enhanced simulator initialized with {camera_type} camera")
+        print(f"PDS data path: {self.pds_data_path}")
+    
+    def _load_config(self, config_path):
+        """Load configuration"""
+        if config_path and Path(config_path).exists():
+            with open(config_path, 'r') as f:
+                return json.load(f)
+        else:
+            return self._create_default_config()
+    
+    def _create_default_config(self):
+        """Create default configuration"""
+        base_dir = Path(os.getcwd())
+        return {
+            'input_path': str(base_dir / "input" / "S07_Mars_Phobos_Deimos"),
+            'output_path': str(base_dir / 'output' / 'enhanced_photometric_validation'),
+            'spice_data_path': str(base_dir / 'spice_kernels'),
+            'pds_data_path': str(base_dir / 'PDS_Data'),
+            'real_images_path': str(base_dir / 'real_hrsc_images'),
+            'body_files': [
+                'g_phobos_287m_spc_0000n00000_v002.obj',
+                'Mars_65k.obj',
+                'g_deimos_162m_spc_0000n00000_v001.obj'
+            ],
+            'scene_file': 'scene_mmx.json',
+            'geometry_file': 'geometry_mmx.json'
         }
-
-        # Validation parameters
-        self.validation_params = {
-            'ssim_threshold': 0.98,
-            'rmse_threshold': 0.05,
-            'ncc_threshold': 0.8,
-        }
-
+    
     def _get_fallback_camera_config(self, camera_type='SRC'):
-        """Fallback camera configuration if SPICE data is not available"""
+        """Fallback camera configuration"""
         if camera_type == 'SRC':
             return {
-                'fov': 0.54,  # degrees
+                'fov': 0.54,
                 'res_x': 1024,
                 'res_y': 1024,
                 'film_exposure': 0.039,
@@ -109,19 +316,11 @@ class PhotometricPhobosSimulator:
                 'clip_end': 100000000.0,
                 'bit_encoding': '16',
                 'viewtransform': 'Standard',
-                'focal_length_mm': 984.76,
-                'f_ratio': 9.2,
-                'pixel_size_microns': [9.0, 9.0],
-                'ifov_rad': 0.00000914,
-                'K': [
-                    [1222.0, 0, 512.0],  # fx, 0, cx
-                    [0, 1222.0, 512.0],  # 0, fy, cy  
-                    [0, 0, 1]            # 0, 0, 1
-                ]
+                'K': [[1222.0, 0, 512.0], [0, 1222.0, 512.0], [0, 0, 1]]
             }
-        else:  # HEAD camera
+        else:
             return {
-                'fov': 11.9,  # degrees
+                'fov': 11.9,
                 'res_x': 5184,
                 'res_y': 1,
                 'film_exposure': 0.039,
@@ -130,71 +329,186 @@ class PhotometricPhobosSimulator:
                 'clip_end': 10000.0,
                 'bit_encoding': '16',
                 'viewtransform': 'Standard',
-                'focal_length_mm': 175.0,
-                'f_ratio': 5.6,
-                'pixel_size_microns': [7.0, 7.0],
-                'ifov_rad': 0.000040,
-                'K': [
-                    [2500.0, 0, 2592.0],  # fx, 0, cx
-                    [0, 2500.0, 0.5],     # 0, fy, cy  
-                    [0, 0, 1]             # 0, 0, 1
-                ]
+                'K': [[2500.0, 0, 2592.0], [0, 2500.0, 0.5], [0, 0, 1]]
             }
-
-    def _load_config(self, config_path):
-        """Load configuration from JSON file or create default."""
-        if config_path and Path(config_path).exists():
-            with open(config_path, 'r') as f:
-                return json.load(f)
-        else:
-            print("Uyarı: config.json bulunamadı. Varsayılan yapılandırma oluşturuluyor.")
-            return self._create_default_config()
-
-    def _create_default_config(self):
-        """Create default configuration based on user's file structure."""
-        base_dir = Path(os.getcwd())
-
-        return {
-            'input_path': str(base_dir / "input" / "S07_Mars_Phobos_Deimos"),
-            'output_path': str(base_dir / 'output' / 'photometric_validation'),
-            'spice_data_path': str(base_dir / 'spice_kernels'),
-            'real_images_path': str(base_dir / 'real_hrsc_images'),
-
-            'body_files': [
-                'g_phobos_287m_spc_0000n00000_v002.obj',
-                'Mars_65k.obj',
-                'g_deimos_162m_spc_0000n00000_v001.obj'
-            ],
+    
+    def process_pds_database(self, pds_directory_path=None):
+        """Process PDS IMG files and create UTC database"""
+        if pds_directory_path is None:
+            pds_directory_path = self.pds_data_path
             
-            'scene_file': 'scene_mmx.json',
-            'geometry_file': 'geometry_mmx.json'
-        }
-
+        print(f"Processing PDS database from: {pds_directory_path}")
+        
+        # Process IMG files
+        img_database = self.pds_processor.process_img_directory(pds_directory_path)
+        
+        # Convert timezone-aware datetimes to timezone-naive for Excel compatibility
+        datetime_cols = ['START_TIME', 'STOP_TIME', 'MEAN_TIME']
+        for col in datetime_cols:
+            if col in img_database.columns:
+                if hasattr(img_database[col].dtype, 'tz') and img_database[col].dtype.tz is not None:
+                    img_database[col] = img_database[col].dt.tz_localize(None)
+        
+        # Save database
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = Path(self.config['output_path'])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        database_path = output_dir / f"pds_img_database_{timestamp}.xlsx"
+        
+        try:
+            img_database.to_excel(database_path, index=False)
+            print(f"PDS database saved to: {database_path}")
+        except Exception as e:
+            print(f"Warning: Could not save Excel file: {e}")
+            # Save as CSV instead
+            csv_path = output_dir / f"pds_img_database_{timestamp}.csv"
+            img_database.to_csv(csv_path, index=False)
+            print(f"PDS database saved as CSV to: {csv_path}")
+        
+        print(f"Total IMG files processed: {len(img_database)}")
+        print(f"Files with valid UTC times: {len(img_database[img_database['STATUS'] == 'SUCCESS'])}")
+        
+        return img_database
+    
+    def run_simulation_batch(self, img_database, max_simulations=None):
+        """Run simulations for all valid UTC times in database"""
+        valid_entries = img_database[img_database['STATUS'] == 'SUCCESS'].copy()
+        
+        if max_simulations:
+            valid_entries = valid_entries.head(max_simulations)
+            
+        print(f"Running simulations for {len(valid_entries)} valid entries")
+        
+        simulation_results = []
+        
+        for idx, row in valid_entries.iterrows():
+            utc_time = row['UTC_MEAN_TIME']
+            img_filename = row['file_name']
+            real_img_path = row['file_path']
+            
+            print(f"\n{'-'*60}")
+            print(f"Processing {idx+1}/{len(valid_entries)}: {img_filename}")
+            print(f"UTC Time: {utc_time}")
+            print(f"{'-'*60}")
+            
+            try:
+                # Run simulation for this UTC time
+                result = self.run_single_simulation(utc_time, real_img_path, img_filename, idx)
+                
+                if result:
+                    simulation_results.append(result)
+                    print(f"✅ Simulation completed for {img_filename}")
+                else:
+                    print(f"❌ Simulation failed for {img_filename}")
+                    
+            except Exception as e:
+                print(f"❌ Error in simulation for {img_filename}: {e}")
+                import traceback
+                traceback.print_exc()
+                
+        return simulation_results
+    
+    def run_single_simulation(self, utc_time, real_img_path, img_filename, index):
+        """Run single simulation and validation"""
+        try:
+            # Setup scene
+            state, spice_data = self.setup_photometric_scene(utc_time)
+            env, cam, bodies, sun = self.create_photometric_environment(state)
+            
+            # Create materials
+            materials = self.create_photometric_materials(state, bodies)
+            
+            # Setup compositing
+            tree = self.setup_photometric_compositing(state)
+            
+            # Scale bodies
+            bodies[0].set_scale(np.array([1.0, 1.0, 1.0]))      # Phobos
+            bodies[1].set_scale(np.array([1000.0, 1000.0, 1000.0]))  # Mars
+            bodies[2].set_scale(np.array([1.0, 1.0, 1.0]))      # Deimos
+            
+            # Position all objects
+            env.PositionAll(state, index=0)
+            
+            # Render
+            env.RenderOne(cam, state, index=index, depth_flag=True)
+            
+            # Get synthetic image path
+            synthetic_img_path = Path(state.path["output_path"]) / "img" / f"{str(index).zfill(6)}.png"
+            
+            # Apply CORTO post-processing if synthetic image exists
+            if synthetic_img_path.exists():
+                # Load synthetic image for post-processing
+                synthetic_img = cv2.imread(str(synthetic_img_path))
+                if synthetic_img is not None:
+                    # Apply CORTO post-processing pipeline
+                    labels = {
+                        'CoB': [synthetic_img.shape[1]//2, synthetic_img.shape[0]//2],
+                        'range': float(np.linalg.norm(spice_data["phobos"]["position"])),
+                        'phase_angle': 0.0
+                    }
+                    
+                    processed_img, processed_labels = self.post_processor.process_image_label_pair(
+                        synthetic_img, labels
+                    )
+                    
+                    # Save processed image
+                    processed_img_path = synthetic_img_path.parent / f"processed_{synthetic_img_path.name}"
+                    cv2.imwrite(str(processed_img_path), processed_img)
+            
+            # Validate if real image exists
+            validation_result = None
+            if Path(real_img_path).exists() and synthetic_img_path.exists():
+                validation_result = self.validator.validate_image_pair(
+                    real_img_path, synthetic_img_path, utc_time, img_filename
+                )
+            
+            # Save blend file for debugging
+            corto.Utils.save_blend(state, f'simulation_{index}_{img_filename.replace(".IMG", "")}')
+            
+            return {
+                'index': index,
+                'utc_time': utc_time,
+                'img_filename': img_filename,
+                'real_img_path': real_img_path,
+                'synthetic_img_path': str(synthetic_img_path),
+                'spice_data': convert_numpy_types(spice_data),
+                'validation_result': validation_result,
+                'status': 'SUCCESS'
+            }
+            
+        except Exception as e:
+            print(f"Error in single simulation: {e}")
+            return {
+                'index': index,
+                'utc_time': utc_time,
+                'img_filename': img_filename,
+                'status': 'FAILED',
+                'error': str(e)
+            }
+    
+    # Include all existing methods from photometric_phobos_simulator.py
     def setup_photometric_scene(self, utc_time):
-        """Set up photometrically correct scene with SRC camera parameters."""
-        print(f"Fotometrik sahne kuruluyor: {utc_time}")
+        """Setup photometrically correct scene"""
+        print(f"Setting up photometric scene for: {utc_time}")
         
         # Clean previous renders
         corto.Utils.clean_scene()
         
-        # Get SPICE data for the given UTC time
+        # Get SPICE data
         try:
             spice_data = self.spice_processor.get_spice_data(utc_time)
         except Exception as e:
             print(f"Warning: Could not get SPICE data: {e}")
-            # Use default data if SPICE fails
             spice_data = self._get_default_spice_data()
         
-        # Write SPICE data to CORTO-compatible geometry file
+        # Create geometry file
         output_dir = Path(self.config['output_path'])
         output_dir.mkdir(parents=True, exist_ok=True)
         dynamic_geometry_path = output_dir / 'geometry_dynamic.json'
         
-        # Convert to CORTO geometry format with proper type conversion
         geometry_data = {
-            "sun": {
-                "position": [convert_numpy_types(spice_data["sun"]["position"])]
-            },
+            "sun": {"position": [convert_numpy_types(spice_data["sun"]["position"])]},
             "camera": {
                 "position": [convert_numpy_types(spice_data["hrsc"]["position"])],
                 "orientation": [convert_numpy_types(spice_data["hrsc"]["quaternion"])]
@@ -216,17 +530,14 @@ class PhotometricPhobosSimulator:
         with open(dynamic_geometry_path, 'w') as f:
             json.dump(geometry_data, f, indent=4)
         
-        # Create updated scene configuration with SRC camera parameters
+        # Create scene configuration
         scene_config = self._create_scene_config()
         scene_config_path = output_dir / 'scene_src.json'
         
-        # Convert scene config to ensure JSON compatibility
-        scene_config_safe = convert_numpy_types(scene_config)
-        
         with open(scene_config_path, 'w') as f:
-            json.dump(scene_config_safe, f, indent=4)
-            
-        # Create CORTO State object
+            json.dump(convert_numpy_types(scene_config), f, indent=4)
+        
+        # Create CORTO State
         state = corto.State(
             scene=str(scene_config_path),
             geometry=str(dynamic_geometry_path),
@@ -234,13 +545,12 @@ class PhotometricPhobosSimulator:
             scenario=self.scenario_name
         )
         
-        # Add photometric paths
         self._add_photometric_paths(state)
         
         return state, spice_data
-
+    
     def _get_default_spice_data(self):
-        """Default SPICE data if actual SPICE processing fails"""
+        """Default SPICE data"""
         return {
             'et': 0.0,
             'phobos': {'position': [0.0, 0.0, 0.0], 'quaternion': [1.0, 0.0, 0.0, 0.0]},
@@ -249,45 +559,35 @@ class PhotometricPhobosSimulator:
             'sun':    {'position': [0.0, 0.0, 0.0], 'quaternion': [1.0, 0.0, 0.0, 0.0]},
             'hrsc':   {'position': [0.0, 0.0, 0.0], 'quaternion': [1.0, 0.0, 0.0, 0.0]}
         }
-
+    
     def _create_scene_config(self):
-        """Create scene configuration with SRC camera parameters."""
-        # Ensure K matrix is properly formatted
+        """Create scene configuration"""
         K_matrix = self.camera_config.get('K', [
             [1222.0, 0, 512.0],
             [0, 1222.0, 512.0],
             [0, 0, 1]
         ])
         
-        scene_config = {
+        return {
             "camera_settings": {
                 "fov": float(self.camera_config['fov']),
                 "res_x": int(self.camera_config['res_x']),
                 "res_y": int(self.camera_config['res_y']),
                 "film_exposure": float(self.camera_config['film_exposure']),
                 "sensor": str(self.camera_config['sensor']),
-                "K": K_matrix,  # This ensures 'K' is always present
+                "K": K_matrix,
                 "clip_start": float(self.camera_config['clip_start']),
                 "clip_end": float(self.camera_config['clip_end']),
                 "bit_encoding": str(self.camera_config['bit_encoding']),
                 "viewtransform": str(self.camera_config['viewtransform'])
             },
             "sun_settings": {
-                "angle": 0.00927,  # Sun angular size as seen from Mars
+                "angle": 0.00927,
                 "energy": float(self.photometric_params['sun_strength'])
             },
-            "body_settings_1": {  # Phobos
-                "pass_index": 1,
-                "diffuse_bounces": 4
-            },
-            "body_settings_2": {  # Mars
-                "pass_index": 2,
-                "diffuse_bounces": 4
-            },
-            "body_settings_3": {  # Deimos
-                "pass_index": 3,
-                "diffuse_bounces": 4
-            },
+            "body_settings_1": {"pass_index": 1, "diffuse_bounces": 4},
+            "body_settings_2": {"pass_index": 2, "diffuse_bounces": 4},
+            "body_settings_3": {"pass_index": 3, "diffuse_bounces": 4},
             "rendering_settings": {
                 "engine": "CYCLES",
                 "device": "CPU",
@@ -295,28 +595,22 @@ class PhotometricPhobosSimulator:
                 "preview_samples": 16
             }
         }
-        return scene_config
-
+    
     def _add_photometric_paths(self, state):
-        """Add photometric maps paths to State object."""
-        # Albedo maps
+        """Add photometric paths"""
         state.add_path('albedo_path_1', os.path.join(state.path["input_path"], 'body', 'albedo', 'Phobos grayscale.jpg'))
         state.add_path('albedo_path_2', os.path.join(state.path["input_path"], 'body', 'albedo', 'mars_1k_color.jpg'))
         state.add_path('albedo_path_3', os.path.join(state.path["input_path"], 'body', 'albedo', 'Deimos grayscale.jpg'))
-
-        # UV Data Files
         state.add_path('uv_data_path_1', os.path.join(state.path["input_path"], 'body', 'uv data', 'g_phobos_287m_spc_0000n00000_v002.json'))
         state.add_path('uv_data_path_2', os.path.join(state.path["input_path"], 'body', 'uv data', 'Mars_65k.json'))
         state.add_path('uv_data_path_3', os.path.join(state.path["input_path"], 'body', 'uv data', 'g_deimos_162m_spc_0000n00000_v001.json'))
-
+    
     def create_photometric_environment(self, state):
-        """Create photometrically calibrated environment with SRC camera."""
-        
-        # Type-safe camera properties (converts numpy types to Python types)
+        """Create photometric environment"""
         cam_props = {
             'fov': float(self.camera_config.get('fov', 0.54)),
-            'res_x': int(self.camera_config.get('res_x', 1024)),          # Python int
-            'res_y': int(self.camera_config.get('res_y', 1024)),          # Python int  
+            'res_x': int(self.camera_config.get('res_x', 1024)),
+            'res_y': int(self.camera_config.get('res_y', 1024)),
             'film_exposure': float(self.photometric_params.get('exposure_time', 0.039)),
             'sensor': str(self.camera_config.get('sensor', 'BW')),
             'clip_start': float(self.camera_config.get('clip_start', 0.1)),
@@ -325,23 +619,18 @@ class PhotometricPhobosSimulator:
             'viewtransform': str(self.camera_config.get('viewtransform', 'Standard'))
         }
         
-        # Handle K matrix with camera-specific fallbacks
-        if 'K' in self.camera_config and self.camera_config['K'] is not None:
+        if 'K' in self.camera_config:
             cam_props['K'] = self.camera_config['K']
         else:
-            if self.camera_type == 'SRC':
-                cam_props['K'] = [[1222.0, 0, 512.0], [0, 1222.0, 512.0], [0, 0, 1]]
-            elif self.camera_type == 'HEAD':
-                cam_props['K'] = [[2500.0, 0, 2592.0], [0, 2500.0, 0.5], [0, 0, 1]]
+            cam_props['K'] = [[1222.0, 0, 512.0], [0, 1222.0, 512.0], [0, 0, 1]]
         
-        # Create CORTO components
+        # Create components
         cam = corto.Camera(f'HRSC_{self.camera_type}_Camera', cam_props)
         sun = corto.Sun('Sun', {'angle': 0.00927, 'energy': float(self.photometric_params['sun_strength'])})
         
-        # Create bodies with fallback properties
         bodies = []
         body_names = [Path(bf).stem for bf in self.config['body_files']]
-        for i, (body_name, body_file) in enumerate(zip(body_names, self.config['body_files'])):
+        for i, body_name in enumerate(body_names):
             try:
                 body_props = getattr(state, f'properties_body_{i+1}')
             except AttributeError:
@@ -352,152 +641,112 @@ class PhotometricPhobosSimulator:
         rendering = corto.Rendering({'engine': 'CYCLES', 'device': 'CPU', 'samples': 256, 'preview_samples': 16})
         env = corto.Environment(cam, bodies, sun, rendering)
         return env, cam, bodies, sun
-        
+    
     def create_photometric_materials(self, state, bodies):
-        """Create photometrically accurate materials"""
+        """Create photometric materials"""
         materials = []
-
+        
         for i, body in enumerate(bodies, 1):
             material = corto.Shading.create_new_material(f'photometric_material_{i}')
-
-            # Set albedo based on photometric parameters
-            albedo_key = ['phobos_albedo', 'mars_albedo', 'deimos_albedo'][i-1]
-            albedo_value = self.photometric_params[albedo_key]
-
-            # Create photometric shading
-            if self.photometric_params['brdf_model'] == 'oren_nayar':
-                settings = {
-                    'albedo': {
-                        'roughness': self.photometric_params['brdf_roughness'],
-                        'colorspace_name': 'Linear CIE-XYZ D65'
-                    }
-                }
-                corto.Shading.oren(material, state, settings, i)
-            else:
-                # Use principled BSDF as default
+            
+            if hasattr(corto.Shading, 'create_branch_albedo_mix'):
                 corto.Shading.create_branch_albedo_mix(material, state, i)
-
-            # Load UV data and assign material
-            corto.Shading.load_uv_data(body, state, i)
+            
+            if hasattr(corto.Shading, 'load_uv_data'):
+                corto.Shading.load_uv_data(body, state, i)
+            
             corto.Shading.assign_material_to_object(material, body)
-
             materials.append(material)
-
+        
         return materials
-
+    
     def setup_photometric_compositing(self, state):
-        """Setup compositing for photometric accuracy"""
+        """Setup compositing"""
         tree = corto.Compositing.create_compositing()
         render_node = corto.Compositing.rendering_node(tree, (0, 0))
-
-        # Create branches for validation
+        
         corto.Compositing.create_img_denoise_branch(tree, render_node)
         corto.Compositing.create_depth_branch(tree, render_node)
         corto.Compositing.create_slopes_branch(tree, render_node, state)
-
-        # Add gamma correction for photometric accuracy
-        gamma_node = corto.Compositing.gamma_node(tree, (600, 0))
-        gamma_node.inputs[1].default_value = 1.0 / self.photometric_params['gamma_correction']
-
+        
         return tree
-
-    def run_photometric_simulation(self, utc_time, real_image_path=None, index=0): 
-        """Run complete photometric simulation with SRC camera"""
-        print(f"Starting photometric simulation for {utc_time}")
-
-        try:
-            # Setup scene
-            state, spice_data = self.setup_photometric_scene(utc_time)
-            env, cam, bodies, sun = self.create_photometric_environment(state)
-
-            # Create materials
-            materials = self.create_photometric_materials(state, bodies)
-
-            # Setup compositing
-            tree = self.setup_photometric_compositing(state)
-
-            # Scale bodies appropriately for SRC camera viewing
-            bodies[0].set_scale(np.array([1.0, 1.0, 1.0]))      # Phobos
-            bodies[1].set_scale(np.array([1000.0, 1000.0, 1000.0]))  # Mars
-            bodies[2].set_scale(np.array([1.0, 1.0, 1.0]))      # Deimos
-
-            # Position all objects
-            env.PositionAll(state, index=0)
-
-            # Render
-            env.RenderOne(cam, state, index=index, depth_flag=True)
-
-            # Validate if real image provided
-            if real_image_path:
-                print("Validation with real image would be performed here")
-
-            # Save results
-            corto.Utils.save_blend(state, f'photometric_debug_for{utc_time}_{camera_type}')
-
-            return state, spice_data
-
-        except Exception as e:
-            print(f"❌ Error in simulation for {utc_time}: {e}")
-            import traceback
-            traceback.print_exc()
-            return None, None
-
-    def save_camera_report(self):
-        """Save detailed camera configuration report"""
-        report_path = os.path.join(self.config['output_path'], f'camera_config_{self.camera_type}.json')
-        
-        full_report = {
-            'camera_type': self.camera_type,
-            'timestamp': datetime.now().isoformat(),
-            'corto_config': self.camera_config,
-            'photometric_params': self.photometric_params
-        }
-        
-        # Convert numpy types to JSON-serializable types
-        full_report_safe = convert_numpy_types(full_report)
-        
-        # Ensure output directory exists
-        os.makedirs(os.path.dirname(report_path), exist_ok=True)
-        
-        with open(report_path, 'w') as f:
-            json.dump(full_report_safe, f, indent=4)
-        
-        print(f"Camera configuration report saved to {report_path}")
-
-
-# Usage example
-if __name__ == "__main__":
-    # Test with both SRC and main HRSC camera
-    camera_types = ['SRC']
     
-    # Example UTC times from HRSC observations
-    utc_times = [
-        "2018-08-02T08:47:45.7005Z",
-        "2019-06-05T10:39:54.6265Z",
-   ]
-
-    for camera_type in camera_types:
-        print(f"\n{'='*60}")
-        print(f"Testing with {camera_type} camera")
-        print(f"{'='*60}")
+    def save_final_results(self, simulation_results, img_database):
+        """Save final comprehensive results"""
+        output_dir = Path(self.config['output_path'])
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        try:
-            simulator = PhotometricPhobosSimulator(camera_type=camera_type)
-            
-            # Save camera configuration report
-            simulator.save_camera_report()
+        # Save simulation results
+        results_path = output_dir / f"simulation_results_{timestamp}.json"
+        with open(results_path, 'w') as f:
+            json.dump(convert_numpy_types(simulation_results), f, indent=4)
+        
+        # Save validation results
+        self.validator.save_validation_results(output_dir)
+        
+        print(f"\nFinal results saved to: {output_dir}")
+        print(f"Total simulations: {len(simulation_results)}")
+        print(f"Successful simulations: {len([r for r in simulation_results if r.get('status') == 'SUCCESS'])}")
+        
+        return results_path
 
-            for index, utc_time in enumerate(utc_times):
-                try:
-                    result = simulator.run_photometric_simulation(utc_time, index=index)
-                    if result[0] is not None:
-                        print(f"✅ Completed simulation for {utc_time} with {camera_type} camera")
-                    else:
-                        print(f"❌ Failed simulation for {utc_time} with {camera_type} camera")
-                except Exception as e:
-                    print(f"❌ Error in simulation for {utc_time}: {e}")
-                    
-        except Exception as e:
-            print(f"❌ Error initializing {camera_type} camera simulator: {e}")
-            import traceback
-            traceback.print_exc()
+
+def main(pds_data_path=None, max_simulations=None, camera_type='SRC'):
+    """Main function to run the enhanced simulator"""
+    print("="*80)
+    print("Enhanced Photometric Phobos Simulator with PDS Integration")
+    print("="*80)
+    
+    # Initialize simulator
+    simulator = EnhancedPhotometricPhobosSimulator(
+        camera_type=camera_type,
+        pds_data_path=pds_data_path
+    )
+    
+    try:
+        # Step 1: Process PDS database
+        print("\n1. Processing PDS database...")
+        if pds_data_path:
+            img_database = simulator.process_pds_database(pds_data_path)
+        else:
+            print("Warning: No PDS data path provided. Using default path.")
+            img_database = simulator.process_pds_database()
+        
+        # Step 2: Run simulations
+        print("\n2. Running simulations...")
+        simulation_results = simulator.run_simulation_batch(img_database, max_simulations)
+        
+        # Step 3: Save results
+        print("\n3. Saving final results...")
+        simulator.save_final_results(simulation_results, img_database)
+        
+        print("\n✅ Enhanced simulation pipeline completed successfully!")
+        
+    except Exception as e:
+        print(f"❌ Error in main pipeline: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    # Configuration - you can modify these parameters
+    
+    # PDS data path - modify this to point to your IMG files
+    PDS_DATA_PATH = "/home/tt_mmx/corto/PDS_Data"  # Change this to your PDS data directory
+    
+    # Maximum number of simulations to run (None for all)
+    MAX_SIMULATIONS = 5  # Set to None to process all IMG files
+    
+    # Camera type
+    CAMERA_TYPE = 'SRC'  # or 'HEAD'
+    
+    print(f"Starting enhanced simulator with:")
+    print(f"PDS Data Path: {PDS_DATA_PATH}")
+    print(f"Max Simulations: {MAX_SIMULATIONS}")
+    print(f"Camera Type: {CAMERA_TYPE}")
+    
+    main(
+        pds_data_path=PDS_DATA_PATH,
+        max_simulations=MAX_SIMULATIONS,
+        camera_type=CAMERA_TYPE
+    )
