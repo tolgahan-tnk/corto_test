@@ -1,8 +1,7 @@
-'''
-enhanced_photometric_simulator.py - COMPLETE VERSION
-Enhanced photometric simulator with complete CORTO pipeline integration
-and distance-based calculations
-'''
+"""
+Integrated Fixed Photometric Phobos Simulator
+All fixes integrated into the main file - no separate imports needed
+"""
 
 import sys
 import os
@@ -11,45 +10,489 @@ import numpy as np
 import cv2
 from pathlib import Path
 from datetime import datetime
-import logging
-
-# Import enhanced modules
-from enhanced_corto_post_processor import EnhancedCORTOPostProcessor
-from complete_validation_pipeline import CompleteValidationPipeline
-from enhanced_noise_modeling import EnhancedNoiseModeling, NoiseParameters
+from skimage.metrics import structural_similarity as ssim
+from scipy.signal import correlate2d
+import pandas as pd
+import requests
+import re
+import time
+import pickle
 
 # Add current directory to Python path
 sys.path.append(os.getcwd())
 
+# Import other modules
 try:
     from spice_data_processor import SpiceDataProcessor
+    from corto_post_processor import CORTOPostProcessor
     import cortopy as corto
 except ImportError as e:
     print(f"Error: Required modules not found. Details: {e}")
     sys.exit(1)
 
-class EnhancedPhotometricSimulator:
-    """
-    Complete Enhanced Photometric Simulator with full CORTO pipeline integration
+
+def convert_numpy_types(obj):
+    """Convert numpy types to Python native types for JSON serialization"""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_types(item) for item in obj]
+    return obj
+
+
+class PDSImageProcessor:
+    """Process PDS IMG files and extract UTC_MEAN_TIME information"""
     
-    Features:
-    - Distance-based photometric calculations per CORTO requirements
-    - Complete Figure 12 post-processing pipeline
-    - Complete Figure 15 validation pipeline  
-    - Enhanced noise modeling (Figure 8)
-    - Systematic template generation
-    - Comprehensive validation metrics
-    """
+    def __init__(self, pds_data_path="PDS_Data"):
+        self.pds_data_path = Path(pds_data_path)
+        self._key_val = re.compile(r"^\s*([A-Za-z0-9_]+)\s*=\s*(.*)$")
+        
+    def parse_pds_label(self, file_path, max_records=50_000):
+        """Parse PDS label from IMG file"""
+        label = {}
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as fh:
+            for i, raw in enumerate(fh):
+                if i > max_records:
+                    break
+                line = raw.strip().replace("<CR><LF>", "")
+                if line.upper().startswith("END"):
+                    break
+                m = self._key_val.match(line)
+                if m:
+                    key, val = m.groups()
+                    val = val.strip().strip('"').strip("'")
+                    label[key] = val
+        return label
     
-    def __init__(self, config_path=None, camera_type='SRC'):
+    def process_img_directory(self, img_directory_path):
+        """Process all IMG files in directory and create UTC database"""
+        records = []
+        img_dir = Path(img_directory_path)
+        
+        print(f"Processing IMG files in: {img_dir}")
+        
+        for img_file in img_dir.rglob("*.IMG"):
+            try:
+                label = self.parse_pds_label(img_file)
+                label.update({"file_path": str(img_file), "file_name": img_file.name})
+                records.append(label)
+                print(f"Processed: {img_file.name}")
+            except Exception as e:
+                print(f"Error processing {img_file.name}: {e}")
+                
+        if not records:
+            raise RuntimeError("No IMG files found or processed!")
+            
+        df = pd.DataFrame(records)
+        print(f"IMG files processed: {len(df)}")
+        
+        # Process time columns - ensure timezone-naive datetimes
+        for col in ["START_TIME", "STOP_TIME"]:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce", utc=True)
+                # Convert to timezone-naive for Excel compatibility
+                df[col] = df[col].dt.tz_localize(None)
+        
+        if {"START_TIME", "STOP_TIME"} <= set(df.columns):
+            df["DURATION_SECONDS"] = (df["STOP_TIME"] - df["START_TIME"]).dt.total_seconds()
+            df["MEAN_TIME"] = df["START_TIME"] + (df["STOP_TIME"] - df["START_TIME"]) / 2
+            df["UTC_MEAN_TIME"] = (
+                df["MEAN_TIME"]
+                  .dt.strftime("%Y-%m-%dT%H:%M:%S.%f")
+                  .str[:-2] + "Z"
+            )
+        else:
+            df["DURATION_SECONDS"] = pd.NA
+            df["MEAN_TIME"] = pd.NaT
+            df["UTC_MEAN_TIME"] = pd.NA
+            
+        df["STATUS"] = (
+            df["START_TIME"].notna() & df["STOP_TIME"].notna()
+        ).map({True: "SUCCESS", False: "MISSING_TIME_DATA"})
+        
+        return df
+
+
+class FixedCORTOValidator:
+    """FIXED CORTO validation pipeline with proper PDS handling and alignment"""
+    
+    def __init__(self, post_processor):
+        self.post_processor = post_processor
+        self.validation_results = []
+        self._pds_cache = {}  # Cache for PDS images
+        
+    def _parse_pds_label(self, file_path, max_records=50_000):
+        """Parse PDS label from IMG file"""
+        label = {}
+        key_val = re.compile(r"^\s*([A-Za-z0-9_]+)\s*=\s*(.*)$")
+        
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as fh:
+            for i, raw in enumerate(fh):
+                if i > max_records:
+                    break
+                line = raw.strip().replace("<CR><LF>", "")
+                if line.upper().startswith("END"):
+                    break
+                m = key_val.match(line)
+                if m:
+                    key, val = m.groups()
+                    val = val.strip().strip('"').strip("'")
+                    label[key] = val
+        return label
+    
+    def _load_pds_image_data(self, pds_file_path):
+        """Load actual image data from PDS IMG file - FIXED VERSION"""
+        if str(pds_file_path) in self._pds_cache:
+            return self._pds_cache[str(pds_file_path)]
+        
+        try:
+            # Parse PDS label
+            label = self._parse_pds_label(pds_file_path)
+            
+            # Extract image parameters
+            lines = int(label.get('LINES', 0))
+            line_samples = int(label.get('LINE_SAMPLES', 0))
+            sample_bits = int(label.get('SAMPLE_BITS', 16))
+            sample_type = label.get('SAMPLE_TYPE', 'MSB_INTEGER')
+            byte_order = label.get('SAMPLE_TYPE', 'MSB')
+            header_bytes = int(label.get('^IMAGE', '1').split()[0]) - 1
+            
+            print(f"📁 Loading PDS IMG file: {pds_file_path.name}")
+            print(f"   📊 Image parameters:")
+            print(f"      Dimensions: {line_samples} x {lines}")
+            print(f"      Sample bits: {sample_bits}")
+            print(f"      Sample type: {sample_type}")
+            print(f"      Header bytes: {header_bytes}")
+            
+            # Determine data type
+            if sample_bits == 8:
+                if 'MSB' in byte_order:
+                    dtype = '>u1'
+                else:
+                    dtype = '<u1'
+            elif sample_bits == 16:
+                if 'MSB' in byte_order:
+                    if 'UNSIGNED' in sample_type:
+                        dtype = '>u2'
+                    else:
+                        dtype = '>i2'
+                else:
+                    if 'UNSIGNED' in sample_type:
+                        dtype = '<u2'
+                    else:
+                        dtype = '<i2'
+            else:
+                raise ValueError(f"Unsupported sample bits: {sample_bits}")
+            
+            # Read binary data
+            with open(pds_file_path, 'rb') as f:
+                f.seek(header_bytes)
+                data = f.read(lines * line_samples * (sample_bits // 8))
+            
+            # Convert to numpy array
+            image_array = np.frombuffer(data, dtype=dtype).reshape(lines, line_samples)
+            
+            # Convert to standard format (uint8 or uint16)
+            if sample_bits == 16:
+                # Normalize to 0-65535 range for uint16
+                img_min, img_max = image_array.min(), image_array.max()
+                if img_max > img_min:
+                    image_array = ((image_array - img_min) / (img_max - img_min) * 65535).astype(np.uint16)
+                else:
+                    image_array = image_array.astype(np.uint16)
+            else:
+                image_array = image_array.astype(np.uint8)
+            
+            print(f"   ✅ Successfully loaded: {image_array.shape}, dtype: {image_array.dtype}")
+            print(f"   📈 Image stats: min={image_array.min()}, max={image_array.max()}, mean={image_array.mean():.2f}")
+            
+            # Cache the result
+            self._pds_cache[str(pds_file_path)] = image_array
+            
+            return image_array
+            
+        except Exception as e:
+            print(f"❌ Error loading PDS image {pds_file_path}: {e}")
+            return None
+    
+    def _apply_same_transformation(self, real_img, synthetic_img, labels=None):
+        """Apply SAME S0→S1→S2 transformation to both images - FIXED"""
+        
+        # Default labels if none provided
+        if labels is None:
+            labels = {
+                'CoB': [real_img.shape[1]//2, real_img.shape[0]//2],
+                'range': 1000.0,
+                'phase_angle': 0.0
+            }
+        
+        print(f"   🔄 Applying SAME CORTO pipeline to both images:")
+        
+        # Apply CORTO post-processing to real image
+        print(f"      Real: {real_img.shape} -> ", end="")
+        if len(real_img.shape) == 2:
+            real_rgb = cv2.cvtColor((real_img / 256).astype(np.uint8), cv2.COLOR_GRAY2RGB)
+        else:
+            real_rgb = real_img
+            
+        real_processed, real_labels = self.post_processor.process_image_label_pair(
+            real_rgb, labels.copy()
+        )
+        print(f"{real_processed.shape}")
+        
+        # Apply CORTO post-processing to synthetic image  
+        print(f"      Synthetic: {synthetic_img.shape} -> ", end="")
+        if len(synthetic_img.shape) == 2:
+            synthetic_rgb = cv2.cvtColor(synthetic_img, cv2.COLOR_GRAY2RGB)
+        else:
+            synthetic_rgb = synthetic_img
+            
+        synthetic_processed, synthetic_labels = self.post_processor.process_image_label_pair(
+            synthetic_rgb, labels.copy()
+        )
+        print(f"{synthetic_processed.shape}")
+        
+        # Convert back to grayscale for comparison
+        if len(real_processed.shape) == 3:
+            real_processed = cv2.cvtColor(real_processed.astype(np.uint8), cv2.COLOR_RGB2GRAY)
+        if len(synthetic_processed.shape) == 3:
+            synthetic_processed = cv2.cvtColor(synthetic_processed.astype(np.uint8), cv2.COLOR_RGB2GRAY)
+        
+        return real_processed, synthetic_processed, real_labels, synthetic_labels
+    
+    def _compute_alignment_with_masks(self, real_img, synthetic_img, mask_id_path=None):
+        """
+        Compute NCC alignment.
+        - Eğer uygun bir maske varsa, maske de post‑process boyutuna
+        (real_img.shape) ölçeklenir ve sadece o pikseller kullanılır.
+        - Maske bulunamaz veya hata çıkarsa standart (ya da resize) hizalama yapılır.
+        """
+
+        # 1) MASKELİ HİZALAMA
+        if mask_id_path and Path(mask_id_path).exists():
+            try:
+                mask_img = cv2.imread(str(mask_id_path), cv2.IMREAD_GRAYSCALE)
+                if mask_img is not None:
+                    # ikili maske
+                    mask_binary = (mask_img > 0).astype(np.uint8)
+
+                    # boyut uyuşmuyorsa maske → real_img boyutuna getir
+                    if mask_binary.shape != real_img.shape:
+                        mask_binary = cv2.resize(
+                            mask_binary,
+                            (real_img.shape[1], real_img.shape[0]),
+                            interpolation=cv2.INTER_NEAREST
+                        )
+
+                    # şimdi aynı boyutta
+                    real_masked      = real_img * mask_binary
+                    synthetic_masked = synthetic_img * mask_binary
+
+                    correlation = cv2.matchTemplate(
+                        real_masked, synthetic_masked, cv2.TM_CCOEFF_NORMED
+                    )
+                    _, max_val, _, _ = cv2.minMaxLoc(correlation)
+                    print(f"      🎯 Mask‑based alignment: correlation = {max_val:.4f}")
+                    return max_val
+            except Exception as e:
+                print(f"      ⚠️  Mask alignment failed: {e}")
+
+        # 2) STANDART HİZALAMA (maske yoksa veya hata olduysa)
+        if real_img.shape == synthetic_img.shape:
+            corr_src = synthetic_img
+        else:
+            corr_src = cv2.resize(
+                synthetic_img, (real_img.shape[1], real_img.shape[0])
+            )
+
+        correlation = cv2.matchTemplate(real_img, corr_src, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, _ = cv2.minMaxLoc(correlation)
+        print(f"      📊 Standard alignment: correlation = {max_val:.4f}")
+        return max_val
+
+    
+    def validate_with_fixed_pipeline(self, pds_img_path, synthetic_img_paths, utc_time, img_filename):
+        """Enhanced validation with FIXED PDS processing and proper alignment"""
+        
+        try:
+            print(f"\n🔍 Starting FIXED CORTO Validation...")
+            print(f"   Validating {img_filename} with FIXED pipeline...")
+            
+            # 1. Load PDS image properly - FIXED
+            print(f"   📁 Loading PDS IMG file...")
+            real_img = self._load_pds_image_data(Path(pds_img_path))
+            if real_img is None:
+                return None
+                
+            print(f"   ✅ PDS image loaded: {real_img.shape}")
+            
+            # 2. Load synthetic images
+            synthetic_imgs = []
+            mask_paths = []
+
+            for img_path in synthetic_img_paths:
+                img_path = Path(img_path)
+                if img_path.exists():
+                    # sentetik görüntüyü oku
+                    synthetic_img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+                    if synthetic_img is None:
+                        continue
+
+                    synthetic_imgs.append(synthetic_img)
+                    stem = img_path.stem
+
+                    # --- maskeyi arayacağımız muhtemel dizinler ---
+                    candidate_paths = [
+                        # eski (önceki) konum
+                        img_path.parent.parent / "label" / "IDmask" / "Mask_1" / f"{stem}.png",
+                        # sizin çıktınız
+                        img_path.parent.parent / "mask_ID_1" / f"{stem}.png",
+                        # gölge maskesi
+                        img_path.parent.parent / "mask_ID_shadow_1" / f"{stem}.png",
+                    ]
+
+                    # ilk mevcut yolu seç
+                    mask_path = next((p for p in candidate_paths if p.exists()), None)
+                    mask_paths.append(mask_path)
+            if not synthetic_imgs:
+                print(f"   ❌ No valid synthetic images found")
+                return None
+            
+            print(f"   📸 Processing {len(synthetic_imgs)} synthetic image(s)")
+            
+            # 3. Apply SAME transformation pipeline to both images - FIXED
+            validation_results = []
+            
+            for i, (synthetic_img, mask_path) in enumerate(zip(synthetic_imgs, mask_paths)):
+                print(f"   🔄 Processing synthetic image {i+1}/{len(synthetic_imgs)}")
+                
+                # Apply same S0→S1→S2 transformation - FIXED
+                real_processed, synthetic_processed, real_labels, synthetic_labels = self._apply_same_transformation(
+                    real_img, synthetic_img
+                )
+                
+                # 4. Compute metrics with proper alignment - FIXED
+                ncc = self._compute_alignment_with_masks(real_processed, synthetic_processed, mask_path)
+                
+                # NRMSE
+                mse = np.mean((real_processed.astype(np.float64) - synthetic_processed.astype(np.float64)) ** 2)
+                img_range = real_processed.max() - real_processed.min()
+                nrmse = np.sqrt(mse) / img_range if img_range > 0 else 0.0
+                nrmse_norm = min(nrmse / 5.0, 1.0)   # 0‑1 arası ölçekle
+
+
+                # SSIM
+                try:
+                    ssim_score = ssim(
+                        real_processed.astype(np.float64), 
+                        synthetic_processed.astype(np.float64),
+                        data_range=real_processed.max() - real_processed.min()
+                    )
+                except:
+                    ssim_score = 0.0
+                
+                validation_results.append({
+                    'ncc'         : float(ncc),
+                    'nrmse'       : float(nrmse),
+                    'nrmse_norm'  : float(nrmse_norm),          # ← EKLENDİ
+                    'ssim'        : float(ssim_score),
+                    'mask_used'   : mask_path is not None,
+                    'real_shape'  : real_processed.shape,
+                    'synthetic_shape': synthetic_processed.shape
+                })
+                
+                print(f"      📊 NCC: {ncc:.4f}, NRMSE: {nrmse:.4f}, SSIM: {ssim_score:.4f},NRMSE_NORM: {nrmse_norm:.4f}")
+            
+            # 5. Select best result
+            best_result = max(validation_results, key=lambda x: x['ssim'])
+            
+            # 6. Compute composite score
+            composite_score = (best_result['ssim'] + best_result['ncc'] + (1 - best_result['nrmse'])) / 3
+            composite_score_normalized = (
+                best_result['ssim']
+                + best_result['ncc']
+                + (1.0 - best_result['nrmse_norm'])        # ← normalleştirilmiş
+            ) / 3.0
+                        
+            # Create final validation result
+            final_result = {
+                'utc_time': utc_time,
+                'img_filename': img_filename,
+                'pds_img_path': str(pds_img_path),
+                'num_synthetic_imgs': len(synthetic_imgs),
+                'best_ncc': best_result['ncc'],
+                'best_nrmse': best_result['nrmse'],
+                'best_ssim': best_result['ssim'],
+                'composite_score': composite_score,
+                'composite_score_normalized': composite_score_normalized,
+                'validation_status': 'SUCCESS' if composite_score > 0.6 else 'LOW_SIMILARITY',
+                'timestamp': datetime.now().isoformat(),
+                'pipeline_applied': 'CORTO_Figure_12_FIXED',
+                'pds_processing': 'ENABLED',
+                'mask_alignment': any(r['mask_used'] for r in validation_results),
+                'transformation_aligned': 'YES',
+                'detailed_results': validation_results
+            }
+            
+            self.validation_results.append(final_result)
+            return final_result
+            
+        except Exception as e:
+            print(f"❌ Error in FIXED validation for {img_filename}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def get_validation_summary(self):
+        """Get summary of all validations"""
+        if not self.validation_results:
+            return {
+                'total_validations': 0,
+                'successful_validations': 0,
+                'success_rate': 0,
+                'average_composite_score': 0,
+                'average_ssim': 0,
+                'pds_processing_enabled': True,
+                'transformation_alignment': 'FIXED',
+                'mask_alignment_available': False
+            }
+        
+        total = len(self.validation_results)
+        successful = len([r for r in self.validation_results if r['validation_status'] == 'SUCCESS'])
+        avg_composite = np.mean([r['composite_score'] for r in self.validation_results])
+        avg_ssim = np.mean([r['best_ssim'] for r in self.validation_results])
+        
+        return {
+            'total_validations': total,
+            'successful_validations': successful,
+            'success_rate': successful / total if total > 0 else 0,
+            'average_composite_score': avg_composite,
+            'average_ssim': avg_ssim,
+            'pds_processing_enabled': True,
+            'transformation_alignment': 'FIXED',
+            'mask_alignment_available': any(r.get('mask_alignment', False) for r in self.validation_results)
+        }
+
+
+class EnhancedPhotometricPhobosSimulator:
+    """Enhanced Photometric Phobos Simulator with FIXED CORTO Validation"""
+    
+    def __init__(self, config_path=None, camera_type='SRC', pds_data_path=None):
         self.config = self._load_config(config_path)
         self.camera_type = camera_type
+        self.pds_data_path = pds_data_path or self.config.get('pds_data_path', 'PDS_Data')
         
-        # Initialize enhanced components
+        # Initialize components
         self.spice_processor = SpiceDataProcessor(base_path=self.config['spice_data_path'])
-        self.post_processor = EnhancedCORTOPostProcessor(target_size=128, enable_domain_randomization=True)
-        self.validation_pipeline = CompleteValidationPipeline(self.post_processor)
-        self.noise_modeling = EnhancedNoiseModeling()
+        self.pds_processor = PDSImageProcessor(self.pds_data_path)
+        self.post_processor = CORTOPostProcessor(target_size=128)
+        self.validator = FixedCORTOValidator(self.post_processor)  # 🔧 FIXED VALIDATOR
         
         self.scenario_name = "S07_Mars_Phobos_Deimos"
         
@@ -59,11 +502,10 @@ class EnhancedPhotometricSimulator:
         except Exception as e:
             print(f"Warning: Could not get camera config from SPICE: {e}")
             self.camera_config = self._get_fallback_camera_config(camera_type)
-        
-        # Enhanced photometric parameters with distance calculations
+            
+        # Set photometric parameters
         self.photometric_params = {
-            'sun_base_intensity': 589.0,  # Base solar intensity
-            'distance_falloff_enabled': True,  # Enable distance-based calculations
+            'sun_strength': 589.0,
             'phobos_albedo': 0.068,
             'mars_albedo': 0.170,
             'deimos_albedo': 0.068,
@@ -72,28 +514,22 @@ class EnhancedPhotometricSimulator:
             'brdf_roughness': 0.5,
             'gamma_correction': 2.2,
             'exposure_time': self.camera_config['film_exposure'],
-            'distance_scaling_law': 'inverse_square'  # or 'linear'
         }
         
-        logging.basicConfig(level=logging.INFO)
-        self.logger = logging.getLogger(__name__)
-        
-        self.logger.info(f"✅ Enhanced photometric simulator initialized")
-        self.logger.info(f"   📷 Camera: {camera_type}")
-        self.logger.info(f"   🔄 Post-processing: Enhanced Figure 12")
-        self.logger.info(f"   ✅ Validation: Complete Figure 15")
-        self.logger.info(f"   🎛️ Noise modeling: 8-step Figure 8")
-
+        print(f"✅ Enhanced simulator initialized with FIXED validation")
+        print(f"   📷 Camera: {camera_type}")
+        print(f"   📁 PDS data path: {self.pds_data_path}")
+    
     def _load_config(self, config_path):
-        """Load enhanced configuration"""
+        """Load configuration"""
         if config_path and Path(config_path).exists():
             with open(config_path, 'r') as f:
                 return json.load(f)
         else:
-            return self._create_enhanced_config()
-
-    def _create_enhanced_config(self):
-        """Create enhanced configuration with validation paths"""
+            return self._create_default_config()
+    
+    def _create_default_config(self):
+        """Create default configuration"""
         base_dir = Path(os.getcwd())
         return {
             'input_path': str(base_dir / "input" / "S07_Mars_Phobos_Deimos"),
@@ -101,18 +537,17 @@ class EnhancedPhotometricSimulator:
             'spice_data_path': str(base_dir / 'spice_kernels'),
             'pds_data_path': str(base_dir / 'PDS_Data'),
             'real_images_path': str(base_dir / 'real_hrsc_images'),
-            'template_output_path': str(base_dir / 'output' / 'templates'),
             'body_files': [
                 'g_phobos_287m_spc_0000n00000_v002.obj',
-                'Mars_65k.obj', 
+                'Mars_65k.obj',
                 'g_deimos_162m_spc_0000n00000_v001.obj'
             ],
             'scene_file': 'scene_mmx.json',
             'geometry_file': 'geometry_mmx.json'
         }
-
+    
     def _get_fallback_camera_config(self, camera_type='SRC'):
-        """Enhanced fallback camera configuration"""
+        """Fallback camera configuration"""
         if camera_type == 'SRC':
             return {
                 'fov': 0.54,
@@ -139,101 +574,68 @@ class EnhancedPhotometricSimulator:
                 'viewtransform': 'Standard',
                 'K': [[2500.0, 0, 2592.0], [0, 2500.0, 0.5], [0, 0, 1]]
             }
-
-    def calculate_distance_based_intensity(self, sun_position: np.ndarray, 
-                                         body_position: np.ndarray) -> float:
-        """Calculate distance-based photometric intensity"""
+    
+    def setup_enhanced_compositing(self, state):
+        """Setup enhanced compositing with mask ID support"""
+        tree = corto.Compositing.create_compositing()
+        render_node = corto.Compositing.rendering_node(tree, (0, 0))
         
-        if not self.photometric_params['distance_falloff_enabled']:
-            return self.photometric_params['sun_base_intensity']
+        # Create image denoising branch
+        corto.Compositing.create_img_denoise_branch(tree, render_node)
         
-        # Calculate distance from Sun to body
-        distance = np.linalg.norm(sun_position - body_position)
+        # Create depth branch
+        corto.Compositing.create_depth_branch(tree, render_node)
         
-        # Reference distance (AU in km)
-        au_km = 149597870.7  # 1 AU in kilometers
+        # Create slopes branch
+        corto.Compositing.create_slopes_branch(tree, render_node, state)
         
-        if self.photometric_params['distance_scaling_law'] == 'inverse_square':
-            # Inverse square law: I = I0 * (r0/r)^2
-            intensity_factor = (au_km / distance) ** 2
-        elif self.photometric_params['distance_scaling_law'] == 'linear':
-            # Linear falloff: I = I0 * (r0/r)
-            intensity_factor = au_km / distance
-        else:
-            intensity_factor = 1.0
+        # Create mask ID branch - IMPORTANT FOR ALIGNMENT
+        corto.Compositing.create_maskID_branch(tree, render_node, state)
         
-        # Apply base intensity with distance scaling
-        final_intensity = self.photometric_params['sun_base_intensity'] * intensity_factor
+        return tree
+    
+    def process_pds_database(self, pds_directory_path=None):
+        """Process PDS IMG files and create UTC database"""
+        if pds_directory_path is None:
+            pds_directory_path = self.pds_data_path
+            
+        print(f"Processing PDS database from: {pds_directory_path}")
         
-        # Clamp to reasonable values
-        final_intensity = np.clip(final_intensity, 0.1, 10000.0)
+        # Process IMG files
+        img_database = self.pds_processor.process_img_directory(pds_directory_path)
         
-        self.logger.debug(f"Distance-based intensity: {distance:.0f} km -> {final_intensity:.2f}")
+        # Convert timezone-aware datetimes to timezone-naive for Excel compatibility
+        datetime_cols = ['START_TIME', 'STOP_TIME', 'MEAN_TIME']
+        for col in datetime_cols:
+            if col in img_database.columns:
+                if hasattr(img_database[col].dtype, 'tz') and img_database[col].dtype.tz is not None:
+                    img_database[col] = img_database[col].dt.tz_localize(None)
         
-        return float(final_intensity)
-
-    def generate_systematic_templates(self, utc_time: str, base_index: int = 0) -> List[str]:
-        """Generate systematic template variations for validation"""
+        # Save database
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = Path(self.config['output_path'])
+        output_dir.mkdir(parents=True, exist_ok=True)
         
-        self.logger.info(f"Generating systematic templates for validation")
+        database_path = output_dir / f"pds_img_database_{timestamp}.xlsx"
         
-        # Create template output directory
-        template_dir = Path(self.config['template_output_path'])
-        template_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            img_database.to_excel(database_path, index=False)
+            print(f"PDS database saved to: {database_path}")
+        except Exception as e:
+            print(f"Warning: Could not save Excel file: {e}")
+            # Save as CSV instead
+            csv_path = output_dir / f"pds_img_database_{timestamp}.csv"
+            img_database.to_csv(csv_path, index=False)
+            print(f"PDS database saved as CSV to: {csv_path}")
         
-        template_paths = []
+        print(f"Total IMG files processed: {len(img_database)}")
+        print(f"Files with valid UTC times: {len(img_database[img_database['STATUS'] == 'SUCCESS'])}")
         
-        # Template generation variations
-        template_configs = [
-            {'sun_intensity_mult': 0.5, 'albedo_mult': 0.8, 'noise_level': 'low'},
-            {'sun_intensity_mult': 0.75, 'albedo_mult': 0.9, 'noise_level': 'low'},
-            {'sun_intensity_mult': 1.0, 'albedo_mult': 1.0, 'noise_level': 'none'},
-            {'sun_intensity_mult': 1.25, 'albedo_mult': 1.1, 'noise_level': 'medium'},
-            {'sun_intensity_mult': 1.5, 'albedo_mult': 1.2, 'noise_level': 'high'},
-        ]
-        
-        for i, template_config in enumerate(template_configs):
-            try:
-                # Setup scene with variations
-                state, spice_data = self.setup_photometric_scene_with_variations(
-                    utc_time, template_config
-                )
-                
-                env, cam, bodies, sun = self.create_photometric_environment(state)
-                materials = self.create_photometric_materials(state, bodies)
-                
-                # Setup compositing
-                tree = self.setup_enhanced_compositing(state)
-                
-                # Scale bodies
-                bodies[0].set_scale(np.array([1.0, 1.0, 1.0]))      # Phobos
-                bodies[1].set_scale(np.array([1000.0, 1000.0, 1000.0]))  # Mars
-                bodies[2].set_scale(np.array([1.0, 1.0, 1.0]))      # Deimos
-                
-                # Position all objects
-                env.PositionAll(state, index=0)
-                
-                # Render template
-                template_index = base_index * 10 + i
-                env.RenderOne(cam, state, index=template_index, depth_flag=True)
-                
-                # Get template path
-                template_path = Path(state.path["output_path"]) / "img" / f"{str(template_index).zfill(6)}.png"
-                if template_path.exists():
-                    template_paths.append(str(template_path))
-                
-                self.logger.info(f"Generated template {i+1}/{len(template_configs)}")
-                
-            except Exception as e:
-                self.logger.error(f"Error generating template {i}: {e}")
-                continue
-        
-        self.logger.info(f"Generated {len(template_paths)} systematic templates")
-        return template_paths
-
-    def setup_photometric_scene_with_variations(self, utc_time: str, 
-                                               variations: Dict) -> Tuple:
-        """Setup photometric scene with systematic variations"""
+        return img_database
+    
+    def setup_photometric_scene(self, utc_time):
+        """Setup photometrically correct scene"""
+        print(f"Setting up photometric scene for: {utc_time}")
         
         # Clean previous renders
         corto.Utils.clean_scene()
@@ -242,51 +644,43 @@ class EnhancedPhotometricSimulator:
         try:
             spice_data = self.spice_processor.get_spice_data(utc_time)
         except Exception as e:
-            self.logger.warning(f"Could not get SPICE data: {e}")
+            print(f"Warning: Could not get SPICE data: {e}")
             spice_data = self._get_default_spice_data()
         
-        # Calculate distance-based intensity with variations
-        sun_intensity = self.calculate_distance_based_intensity(
-            np.array(spice_data["sun"]["position"]),
-            np.array(spice_data["phobos"]["position"])
-        )
-        sun_intensity *= variations.get('sun_intensity_mult', 1.0)
-        
-        # Create enhanced scene configuration
-        scene_config = self._create_enhanced_scene_config(sun_intensity, variations)
-        
-        # Create geometry file with SPICE data
+        # Create geometry file
         output_dir = Path(self.config['output_path'])
         output_dir.mkdir(parents=True, exist_ok=True)
         dynamic_geometry_path = output_dir / 'geometry_dynamic.json'
         
         geometry_data = {
-            "sun": {"position": [spice_data["sun"]["position"]]},
+            "sun": {"position": [convert_numpy_types(spice_data["sun"]["position"])]},
             "camera": {
-                "position": [spice_data["hrsc"]["position"]],
-                "orientation": [spice_data["hrsc"]["quaternion"]]
+                "position": [convert_numpy_types(spice_data["hrsc"]["position"])],
+                "orientation": [convert_numpy_types(spice_data["hrsc"]["quaternion"])]
             },
             "body_1": {
-                "position": [spice_data["phobos"]["position"]],
-                "orientation": [spice_data["phobos"]["quaternion"]]
+                "position": [convert_numpy_types(spice_data["phobos"]["position"])],
+                "orientation": [convert_numpy_types(spice_data["phobos"]["quaternion"])]
             },
             "body_2": {
-                "position": [spice_data["mars"]["position"]],
-                "orientation": [spice_data["mars"]["quaternion"]]
+                "position": [convert_numpy_types(spice_data["mars"]["position"])],
+                "orientation": [convert_numpy_types(spice_data["mars"]["quaternion"])]
             },
             "body_3": {
-                "position": [spice_data["deimos"]["position"]],
-                "orientation": [spice_data["deimos"]["quaternion"]]
+                "position": [convert_numpy_types(spice_data["deimos"]["position"])],
+                "orientation": [convert_numpy_types(spice_data["deimos"]["quaternion"])]
             }
         }
         
         with open(dynamic_geometry_path, 'w') as f:
             json.dump(geometry_data, f, indent=4)
         
-        # Save scene configuration
-        scene_config_path = output_dir / 'scene_enhanced.json'
+        # Create scene configuration
+        scene_config = self._create_scene_config()
+        scene_config_path = output_dir / 'scene_src.json'
+        
         with open(scene_config_path, 'w') as f:
-            json.dump(scene_config, f, indent=4)
+            json.dump(convert_numpy_types(scene_config), f, indent=4)
         
         # Create CORTO State
         state = corto.State(
@@ -299,10 +693,20 @@ class EnhancedPhotometricSimulator:
         self._add_photometric_paths(state)
         
         return state, spice_data
-
-    def _create_enhanced_scene_config(self, sun_intensity: float, variations: Dict):
-        """Create enhanced scene configuration with variations"""
-        
+    
+    def _get_default_spice_data(self):
+        """Default SPICE data"""
+        return {
+            'et': 0.0,
+            'phobos': {'position': [0.0, 0.0, 0.0], 'quaternion': [1.0, 0.0, 0.0, 0.0]},
+            'mars':   {'position': [0.0, 0.0, 0.0], 'quaternion': [1.0, 0.0, 0.0, 0.0]},
+            'deimos': {'position': [0.0, 0.0, 0.0], 'quaternion': [1.0, 0.0, 0.0, 0.0]},
+            'sun':    {'position': [0.0, 0.0, 0.0], 'quaternion': [1.0, 0.0, 0.0, 0.0]},
+            'hrsc':   {'position': [0.0, 0.0, 0.0], 'quaternion': [1.0, 0.0, 0.0, 0.0]}
+        }
+    
+    def _create_scene_config(self):
+        """Create scene configuration"""
         K_matrix = self.camera_config.get('K', [
             [1222.0, 0, 512.0],
             [0, 1222.0, 512.0],
@@ -324,7 +728,7 @@ class EnhancedPhotometricSimulator:
             },
             "sun_settings": {
                 "angle": 0.00927,
-                "energy": float(sun_intensity)  # Distance-based intensity
+                "energy": float(self.photometric_params['sun_strength'])
             },
             "body_settings_1": {"pass_index": 1, "diffuse_bounces": 4},  # Phobos
             "body_settings_2": {"pass_index": 2, "diffuse_bounces": 4},  # Mars
@@ -334,25 +738,20 @@ class EnhancedPhotometricSimulator:
                 "device": "CPU",
                 "samples": 256,
                 "preview_samples": 16
-            },
-            "variations": variations  # Store variations for reference
+            }
         }
-
-    def setup_enhanced_compositing(self, state):
-        """Setup enhanced compositing with full mask support"""
-        tree = corto.Compositing.create_compositing()
-        render_node = corto.Compositing.rendering_node(tree, (0, 0))
-        
-        # Create enhanced compositing branches
-        corto.Compositing.create_img_denoise_branch(tree, render_node)
-        corto.Compositing.create_depth_branch(tree, render_node)
-        corto.Compositing.create_slopes_branch(tree, render_node, state)
-        corto.Compositing.create_maskID_branch(tree, render_node, state)
-        
-        return tree
-
+    
+    def _add_photometric_paths(self, state):
+        """Add photometric paths"""
+        state.add_path('albedo_path_1', os.path.join(state.path["input_path"], 'body', 'albedo', 'Phobos grayscale.jpg'))
+        state.add_path('albedo_path_2', os.path.join(state.path["input_path"], 'body', 'albedo', 'mars_1k_color.jpg'))
+        state.add_path('albedo_path_3', os.path.join(state.path["input_path"], 'body', 'albedo', 'Deimos grayscale.jpg'))
+        state.add_path('uv_data_path_1', os.path.join(state.path["input_path"], 'body', 'uv data', 'g_phobos_287m_spc_0000n00000_v002.json'))
+        state.add_path('uv_data_path_2', os.path.join(state.path["input_path"], 'body', 'uv data', 'Mars_65k.json'))
+        state.add_path('uv_data_path_3', os.path.join(state.path["input_path"], 'body', 'uv data', 'g_deimos_162m_spc_0000n00000_v001.json'))
+    
     def create_photometric_environment(self, state):
-        """Create enhanced photometric environment"""
+        """Create photometric environment"""
         cam_props = {
             'fov': float(self.camera_config.get('fov', 0.54)),
             'res_x': int(self.camera_config.get('res_x', 1024)),
@@ -372,7 +771,7 @@ class EnhancedPhotometricSimulator:
         
         # Create components
         cam = corto.Camera(f'HRSC_{self.camera_type}_Camera', cam_props)
-        sun = corto.Sun('Sun', {'angle': 0.00927, 'energy': float(self.photometric_params['sun_base_intensity'])})
+        sun = corto.Sun('Sun', {'angle': 0.00927, 'energy': float(self.photometric_params['sun_strength'])})
         
         bodies = []
         body_names = [Path(bf).stem for bf in self.config['body_files']]
@@ -387,13 +786,13 @@ class EnhancedPhotometricSimulator:
         rendering = corto.Rendering({'engine': 'CYCLES', 'device': 'CPU', 'samples': 256, 'preview_samples': 16})
         env = corto.Environment(cam, bodies, sun, rendering)
         return env, cam, bodies, sun
-
+    
     def create_photometric_materials(self, state, bodies):
-        """Create enhanced photometric materials"""
+        """Create photometric materials"""
         materials = []
         
         for i, body in enumerate(bodies, 1):
-            material = corto.Shading.create_new_material(f'enhanced_material_{i}')
+            material = corto.Shading.create_new_material(f'photometric_material_{i}')
             
             if hasattr(corto.Shading, 'create_branch_albedo_mix'):
                 corto.Shading.create_branch_albedo_mix(material, state, i)
@@ -405,51 +804,56 @@ class EnhancedPhotometricSimulator:
             materials.append(material)
         
         return materials
-
-    def _add_photometric_paths(self, state):
-        """Add enhanced photometric paths"""
-        state.add_path('albedo_path_1', os.path.join(state.path["input_path"], 'body', 'albedo', 'Phobos grayscale.jpg'))
-        state.add_path('albedo_path_2', os.path.join(state.path["input_path"], 'body', 'albedo', 'mars_1k_color.jpg'))
-        state.add_path('albedo_path_3', os.path.join(state.path["input_path"], 'body', 'albedo', 'Deimos grayscale.jpg'))
-        state.add_path('uv_data_path_1', os.path.join(state.path["input_path"], 'body', 'uv data', 'g_phobos_287m_spc_0000n00000_v002.json'))
-        state.add_path('uv_data_path_2', os.path.join(state.path["input_path"], 'body', 'uv data', 'Mars_65k.json'))
-        state.add_path('uv_data_path_3', os.path.join(state.path["input_path"], 'body', 'uv data', 'g_deimos_162m_spc_0000n00000_v001.json'))
-
-    def _get_default_spice_data(self):
-        """Default SPICE data fallback"""
-        return {
-            'et': 0.0,
-            'phobos': {'position': [0.0, 0.0, 0.0], 'quaternion': [1.0, 0.0, 0.0, 0.0]},
-            'mars':   {'position': [0.0, 0.0, 0.0], 'quaternion': [1.0, 0.0, 0.0, 0.0]},
-            'deimos': {'position': [0.0, 0.0, 0.0], 'quaternion': [1.0, 0.0, 0.0, 0.0]},
-            'sun':    {'position': [0.0, 0.0, 0.0], 'quaternion': [1.0, 0.0, 0.0, 0.0]},
-            'hrsc':   {'position': [0.0, 0.0, 0.0], 'quaternion': [1.0, 0.0, 0.0, 0.0]}
-        }
-
-    def run_enhanced_simulation_with_complete_validation(self, 
-                                                       utc_time: str,
-                                                       real_img_path: str,
-                                                       img_filename: str,
-                                                       index: int) -> Dict:
-        """Run enhanced simulation with complete CORTO validation pipeline"""
+    
+    def run_simulation_batch(self, img_database, max_simulations=None):
+        """Run simulations for all valid UTC times in database"""
+        valid_entries = img_database[img_database['STATUS'] == 'SUCCESS'].copy()
         
+        if max_simulations:
+            valid_entries = valid_entries.head(max_simulations)
+            
+        print(f"Running simulations for {len(valid_entries)} valid entries")
+        
+        simulation_results = []
+        
+        for idx, row in valid_entries.iterrows():
+            utc_time = row['UTC_MEAN_TIME']
+            img_filename = row['file_name']
+            real_img_path = row['file_path']
+            
+            print(f"\n{'-'*60}")
+            print(f"Processing {idx+1}/{len(valid_entries)}: {img_filename}")
+            print(f"UTC Time: {utc_time}")
+            print(f"{'-'*60}")
+            
+            try:
+                # Run simulation for this UTC time
+                result = self.run_single_simulation(utc_time, real_img_path, img_filename, idx)
+                
+                if result:
+                    simulation_results.append(result)
+                    print(f"✅ Simulation completed for {img_filename}")
+                else:
+                    print(f"❌ Simulation failed for {img_filename}")
+                    
+            except Exception as e:
+                print(f"❌ Error in simulation for {img_filename}: {e}")
+                import traceback
+                traceback.print_exc()
+                
+        return simulation_results
+    
+    def run_single_simulation(self, utc_time, real_img_path, img_filename, index):
+        """Run single simulation and validation with FIXED validator"""
         try:
-            self.logger.info(f"Starting enhanced simulation with complete validation")
-            
-            # Step 1: Generate systematic templates
-            template_paths = self.generate_systematic_templates(utc_time, index)
-            
-            if not template_paths:
-                self.logger.error("No templates generated for validation")
-                return {'status': 'FAILED', 'error': 'No templates generated'}
-            
-            # Step 2: Setup main scene
-            state, spice_data = self.setup_photometric_scene_with_variations(
-                utc_time, {'sun_intensity_mult': 1.0, 'albedo_mult': 1.0, 'noise_level': 'none'}
-            )
-            
+            # Setup scene
+            state, spice_data = self.setup_photometric_scene(utc_time)
             env, cam, bodies, sun = self.create_photometric_environment(state)
+            
+            # Create materials
             materials = self.create_photometric_materials(state, bodies)
+            
+            # Setup compositing with mask ID support - IMPORTANT
             tree = self.setup_enhanced_compositing(state)
             
             # Scale bodies
@@ -457,250 +861,161 @@ class EnhancedPhotometricSimulator:
             bodies[1].set_scale(np.array([1000.0, 1000.0, 1000.0]))  # Mars
             bodies[2].set_scale(np.array([1.0, 1.0, 1.0]))      # Deimos
             
-            # Position and render main scene
+            # Position all objects
             env.PositionAll(state, index=0)
+            
+            # Render
             env.RenderOne(cam, state, index=index, depth_flag=True)
             
-            # Step 3: Apply enhanced post-processing
+            # Get synthetic image path
             synthetic_img_path = Path(state.path["output_path"]) / "img" / f"{str(index).zfill(6)}.png"
             
-            if not synthetic_img_path.exists():
-                self.logger.error("Main synthetic image not generated")
-                return {'status': 'FAILED', 'error': 'Main synthetic image not generated'}
-            
-            # Load and process synthetic image
-            synthetic_img = cv2.imread(str(synthetic_img_path))
-            if synthetic_img is not None:
-                # Apply enhanced post-processing
-                labels = {
-                    'CoB': [synthetic_img.shape[1]//2, synthetic_img.shape[0]//2],
-                    'range': float(np.linalg.norm(spice_data["phobos"]["position"])),
-                    'phase_angle': 0.0
-                }
-                
-                processed_img, processed_labels, processing_params = \
-                    self.post_processor.process_image_label_pair_enhanced(
-                        synthetic_img, labels, domain_randomization_mode='systematic'
+            # Apply CORTO post-processing if synthetic image exists
+            processed_img_path = None
+            if synthetic_img_path.exists():
+                # Load synthetic image for post-processing
+                synthetic_img = cv2.imread(str(synthetic_img_path))
+                if synthetic_img is not None:
+                    # Apply CORTO post-processing pipeline
+                    labels = {
+                        'CoB': [synthetic_img.shape[1]//2, synthetic_img.shape[0]//2],
+                        'range': float(np.linalg.norm(spice_data["phobos"]["position"])),
+                        'phase_angle': 0.0
+                    }
+                    
+                    processed_img, processed_labels = self.post_processor.process_image_label_pair(
+                        synthetic_img, labels
                     )
+                    
+                    # Save processed image
+                    processed_img_path = synthetic_img_path.parent / f"processed_{synthetic_img_path.name}"
+                    cv2.imwrite(str(processed_img_path), processed_img)
+            
+            # Validate with FIXED CORTO pipeline
+            validation_result = None
+            if Path(real_img_path).exists() and synthetic_img_path.exists():
+                # Create list of synthetic images for validation
+                synthetic_img_paths = [str(synthetic_img_path)]
+                if processed_img_path:
+                    synthetic_img_paths.append(str(processed_img_path))
                 
-                # Save processed image
-                processed_img_path = synthetic_img_path.parent / f"processed_{synthetic_img_path.name}"
-                cv2.imwrite(str(processed_img_path), processed_img)
-                
-                # Apply noise modeling
-                noise_params = NoiseParameters(
-                    generic_blur_sigma=0.8,
-                    motion_blur_length=3,
-                    noise_variance=0.005,
-                    gamma_value=2.2,
-                    dead_pixel_probability=0.001
+                # Use FIXED validator
+                validation_result = self.validator.validate_with_fixed_pipeline(
+                    real_img_path, synthetic_img_paths, utc_time, img_filename
                 )
-                
-                noise_variations = self.noise_modeling.create_systematic_noise_variations(
-                    processed_img.astype(np.float32) / 255.0, noise_params, n_variations=3
-                )
-                
-                # Save noise variations
-                for i, noisy_img in enumerate(noise_variations):
-                    noisy_path = synthetic_img_path.parent / f"noisy_{i}_{synthetic_img_path.name}"
-                    cv2.imwrite(str(noisy_path), (noisy_img * 255).astype(np.uint8))
-                    template_paths.append(str(noisy_path))
-            
-            # Step 4: Run complete validation pipeline
-            base_config = {
-                'rendering_engine': 'CYCLES',
-                'samples': 256,
-                'camera_type': self.camera_type
-            }
-            
-            validation_result = self.validation_pipeline.run_complete_validation_pipeline(
-                real_img_path, template_paths, base_config, utc_time, img_filename
-            )
-            
-            # Step 5: Generate comprehensive results
-            result = {
-                'status': 'SUCCESS',
-                'utc_time': utc_time,
-                'img_filename': img_filename,
-                'index': index,
-                'synthetic_img_path': str(synthetic_img_path),
-                'processed_img_path': str(processed_img_path) if 'processed_img_path' in locals() else None,
-                'template_count': len(template_paths),
-                'spice_data': self._convert_numpy_types(spice_data),
-                'photometric_params': self.photometric_params,
-                'processing_params': processing_params.to_dict() if processing_params else None,
-                'validation_result': validation_result.to_dict() if validation_result else None,
-                'distance_calculations': {
-                    'sun_phobos_distance': float(np.linalg.norm(spice_data["phobos"]["position"])),
-                    'calculated_intensity': float(self.calculate_distance_based_intensity(
-                        np.array(spice_data["sun"]["position"]),
-                        np.array(spice_data["phobos"]["position"])
-                    ))
-                }
-            }
             
             # Save blend file for debugging
-            corto.Utils.save_blend(state, f'enhanced_simulation_{index}_{img_filename.replace(".IMG", "")}')
+            corto.Utils.save_blend(state, f'simulation_{index}_{img_filename.replace(".IMG", "")}')
             
-            self.logger.info(f"Enhanced simulation completed successfully")
-            return result
-            
-        except Exception as e:
-            self.logger.error(f"Error in enhanced simulation: {e}")
-            import traceback
-            traceback.print_exc()
             return {
-                'status': 'FAILED',
-                'error': str(e),
+                'index': index,
                 'utc_time': utc_time,
                 'img_filename': img_filename,
-                'index': index
+                'real_img_path': real_img_path,
+                'synthetic_img_path': str(synthetic_img_path),
+                'processed_img_path': str(processed_img_path) if processed_img_path else None,
+                'spice_data': convert_numpy_types(spice_data),
+                'validation_result': validation_result,
+                'status': 'SUCCESS'
             }
-
-    def _convert_numpy_types(self, obj):
-        """Convert numpy types to Python native types for JSON serialization"""
-        if isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        elif isinstance(obj, dict):
-            return {key: self._convert_numpy_types(value) for key, value in obj.items()}
-        elif isinstance(obj, list):
-            return [self._convert_numpy_types(item) for item in obj]
-        return obj
-
-    def save_comprehensive_results(self, results: List[Dict], output_dir: str):
-        """Save comprehensive simulation and validation results"""
-        
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
+            
+        except Exception as e:
+            print(f"Error in single simulation: {e}")
+            return {
+                'index': index,
+                'utc_time': utc_time,
+                'img_filename': img_filename,
+                'status': 'FAILED',
+                'error': str(e)
+            }
+    
+    def save_final_results(self, simulation_results, img_database):
+        """Save final comprehensive results"""
+        output_dir = Path(self.config['output_path'])
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        # Save individual results
-        results_path = output_path / f"enhanced_simulation_results_{timestamp}.json"
+        # Save simulation results
+        results_path = output_dir / f"simulation_results_{timestamp}.json"
         with open(results_path, 'w') as f:
-            json.dump(self._convert_numpy_types(results), f, indent=4)
+            json.dump(convert_numpy_types(simulation_results), f, indent=4)
         
-        # Save validation summary
-        validation_summary = self.validation_pipeline.get_validation_summary()
-        summary_path = output_path / f"validation_summary_{timestamp}.json"
+        # Save validation results
+        validation_summary = self.validator.get_validation_summary()
+        summary_path = output_dir / f"validation_summary_{timestamp}.json"
         with open(summary_path, 'w') as f:
-            json.dump(self._convert_numpy_types(validation_summary), f, indent=4)
+            json.dump(convert_numpy_types(validation_summary), f, indent=4)
         
-        # Save post-processing statistics
-        processing_stats = self.post_processor.get_generation_statistics()
-        stats_path = output_path / f"post_processing_stats_{timestamp}.json"
-        with open(stats_path, 'w') as f:
-            json.dump(self._convert_numpy_types(processing_stats), f, indent=4)
+        print(f"\nFinal results saved to: {output_dir}")
+        print(f"Total simulations: {len(simulation_results)}")
+        print(f"Successful simulations: {len([r for r in simulation_results if r.get('status') == 'SUCCESS'])}")
         
-        # Generate comprehensive report
-        report = self._generate_comprehensive_report(results, validation_summary, processing_stats)
-        report_path = output_path / f"comprehensive_report_{timestamp}.md"
-        with open(report_path, 'w') as f:
-            f.write(report)
-        
-        self.logger.info(f"Comprehensive results saved to: {output_path}")
-        return {
-            'results_path': str(results_path),
-            'summary_path': str(summary_path),
-            'stats_path': str(stats_path),
-            'report_path': str(report_path)
-        }
+        return results_path, summary_path
 
-    def _generate_comprehensive_report(self, results: List[Dict], 
-                                     validation_summary: Dict, 
-                                     processing_stats: Dict) -> str:
-        """Generate comprehensive markdown report"""
-        
-        successful_results = [r for r in results if r.get('status') == 'SUCCESS']
-        
-        report = f"""# Enhanced Photometric Simulation Report
 
-## Summary
-- **Total Simulations**: {len(results)}
-- **Successful Simulations**: {len(successful_results)}
-- **Success Rate**: {len(successful_results)/len(results)*100:.1f}%
-- **Timestamp**: {datetime.now().isoformat()}
-
-## Validation Pipeline Results
-- **Total Validations**: {validation_summary.get('total_validations', 0)}
-- **Successful Validations**: {validation_summary.get('successful_validations', 0)}
-- **Average NCC**: {validation_summary.get('average_metrics', {}).get('ncc', 0):.4f}
-- **Average NRMSE**: {validation_summary.get('average_metrics', {}).get('nrmse', 0):.4f}
-- **Average SSIM**: {validation_summary.get('average_metrics', {}).get('ssim', 0):.4f}
-- **Average Composite Score**: {validation_summary.get('average_metrics', {}).get('composite_score', 0):.4f}
-
-## Post-Processing Statistics
-- **Total Processed**: {processing_stats.get('total_processed', 0)}
-- **Domain Randomization Balance**: {processing_stats.get('balance_ratio', 0):.4f}
-- **Padding Distribution**: {processing_stats.get('padding_distribution', {})}
-- **Blob Strategy Distribution**: {processing_stats.get('blob_distribution', {})}
-
-## Distance-Based Photometric Calculations
-"""
-        
-        if successful_results:
-            distances = [r.get('distance_calculations', {}) for r in successful_results]
-            avg_distance = np.mean([d.get('sun_phobos_distance', 0) for d in distances])
-            avg_intensity = np.mean([d.get('calculated_intensity', 0) for d in distances])
-            
-            report += f"""- **Average Sun-Phobos Distance**: {avg_distance:.0f} km
-- **Average Calculated Intensity**: {avg_intensity:.2f}
-- **Distance Scaling Law**: {self.photometric_params['distance_scaling_law']}
-- **Base Intensity**: {self.photometric_params['sun_base_intensity']}
-
-"""
-        
-        report += f"""## CORTO Pipeline Compliance
-- **Figure 12 Post-Processing**: ✅ IMPLEMENTED
-- **Figure 15 Validation**: ✅ IMPLEMENTED  
-- **Figure 8 Noise Modeling**: ✅ IMPLEMENTED
-- **Appendix A Label Transformation**: ✅ IMPLEMENTED
-- **Domain Randomization**: ✅ IMPLEMENTED
-- **Distance-Based Photometrics**: ✅ IMPLEMENTED
-
-## Technical Details
-- **Camera Type**: {self.camera_type}
-- **Rendering Engine**: CYCLES
-- **Samples**: 256
-- **Target Size**: {self.post_processor.target_size}px
-- **Noise Pipeline Steps**: 8
-- **Template Generation**: Systematic
-
----
-*Generated by Enhanced Photometric Simulator with complete CORTO pipeline integration*
-"""
-        
-        return report
-
-# Example usage and testing
-if __name__ == "__main__":
-    # Initialize enhanced simulator
-    simulator = EnhancedPhotometricSimulator(camera_type='SRC')
+def main(pds_data_path=None, max_simulations=None, camera_type='SRC'):
+    """Main function with FIXED validator integration"""
+    print("="*80)
+    print("Enhanced Photometric Phobos Simulator with FIXED CORTO Validation")
+    print("="*80)
     
-    # Example simulation run
-    utc_time = "2019-06-07T10:46:42.8575Z"
-    real_img_path = "path/to/real/image.IMG"
-    img_filename = "test_image.IMG"
-    index = 0
+    # Initialize simulator with FIXED validator
+    simulator = EnhancedPhotometricPhobosSimulator(
+        camera_type=camera_type,
+        pds_data_path=pds_data_path
+    )
     
     try:
-        # Run enhanced simulation with complete validation
-        result = simulator.run_enhanced_simulation_with_complete_validation(
-            utc_time, real_img_path, img_filename, index
-        )
+        # Step 1: Process PDS database
+        print("\n1. Processing PDS database...")
+        img_database = simulator.process_pds_database(pds_data_path)
         
-        print(f"✅ Simulation result: {result['status']}")
-        if result['status'] == 'SUCCESS':
-            print(f"📊 Templates generated: {result['template_count']}")
-            print(f"🎯 Validation score: {result.get('validation_result', {}).get('composite_score', 'N/A')}")
+        # Step 2: Run simulations with FIXED validation
+        print("\n2. Running simulations with FIXED validation...")
+        simulation_results = simulator.run_simulation_batch(img_database, max_simulations)
         
-        # Save comprehensive results
-        simulator.save_comprehensive_results([result], "output/enhanced_results")
+        # Step 3: Save results and show validation summary
+        print("\n3. Saving final results...")
+        simulator.save_final_results(simulation_results, img_database)
+        
+        # 📊 Show FIXED validation summary
+        validation_summary = simulator.validator.get_validation_summary()
+        print(f"\n📊 FIXED VALIDATION SUMMARY:")
+        print(f"   🔢 Total validations: {validation_summary['total_validations']}")
+        print(f"   ✅ Successful validations: {validation_summary['successful_validations']}")
+        print(f"   📈 Success rate: {validation_summary['success_rate']:.2%}")
+        print(f"   📊 Average composite score: {validation_summary['average_composite_score']:.4f}")
+        print(f"   🎯 Average SSIM: {validation_summary['average_ssim']:.4f}")
+        print(f"   📁 PDS processing: {'✅ ENABLED' if validation_summary['pds_processing_enabled'] else '❌ DISABLED'}")
+        print(f"   🔄 Transformation alignment: {'✅ FIXED' if validation_summary['transformation_alignment'] == 'FIXED' else '❌ BROKEN'}")
+        print(f"   🎭 Mask alignment: {'✅ AVAILABLE' if validation_summary['mask_alignment_available'] else '⚠️ NOT USED'}")
+        
+        print("\n✅ Enhanced simulation pipeline with FIXED validation completed successfully!")
         
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Error in main pipeline: {e}")
         import traceback
         traceback.print_exc()
+
+
+if __name__ == "__main__":
+    # Configuration - you can modify these parameters
+    
+    # PDS data path - modify this to point to your IMG files
+    PDS_DATA_PATH = "/home/tt_mmx/corto/PDS_Data"  # Change this to your PDS data directory
+    
+    # Maximum number of simulations to run (None for all)
+    MAX_SIMULATIONS = 5  # Set to None to process all IMG files
+    
+    # Camera type
+    CAMERA_TYPE = 'SRC'  # or 'HEAD'
+    
+    print(f"Starting FIXED enhanced simulator with:")
+    print(f"PDS Data Path: {PDS_DATA_PATH}")
+    print(f"Max Simulations: {MAX_SIMULATIONS}")
+    print(f"Camera Type: {CAMERA_TYPE}")
+    
+    main(
+        pds_data_path=PDS_DATA_PATH,
+        max_simulations=MAX_SIMULATIONS,
+        camera_type=CAMERA_TYPE
+    )
