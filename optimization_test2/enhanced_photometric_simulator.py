@@ -1,7 +1,7 @@
 '''
-enhanced_photometric_simulator.py
-Enhanced photometric simulator with distance-based calculations
-and complete CORTO pipeline integration
+enhanced_photometric_simulator.py - COMPLETE VERSION
+Enhanced photometric simulator with complete CORTO pipeline integration
+and distance-based calculations
 '''
 
 import sys
@@ -30,14 +30,15 @@ except ImportError as e:
 
 class EnhancedPhotometricSimulator:
     """
-    Enhanced photometric simulator with complete CORTO pipeline integration
+    Complete Enhanced Photometric Simulator with full CORTO pipeline integration
     
     Features:
-    - Distance-based photometric calculations
-    - Complete Figure 12 post-processing
-    - Complete Figure 15 validation
+    - Distance-based photometric calculations per CORTO requirements
+    - Complete Figure 12 post-processing pipeline
+    - Complete Figure 15 validation pipeline  
     - Enhanced noise modeling (Figure 8)
     - Systematic template generation
+    - Comprehensive validation metrics
     """
     
     def __init__(self, config_path=None, camera_type='SRC'):
@@ -501,4 +502,205 @@ class EnhancedPhotometricSimulator:
                 
                 # Save noise variations
                 for i, noisy_img in enumerate(noise_variations):
-                    noisy
+                    noisy_path = synthetic_img_path.parent / f"noisy_{i}_{synthetic_img_path.name}"
+                    cv2.imwrite(str(noisy_path), (noisy_img * 255).astype(np.uint8))
+                    template_paths.append(str(noisy_path))
+            
+            # Step 4: Run complete validation pipeline
+            base_config = {
+                'rendering_engine': 'CYCLES',
+                'samples': 256,
+                'camera_type': self.camera_type
+            }
+            
+            validation_result = self.validation_pipeline.run_complete_validation_pipeline(
+                real_img_path, template_paths, base_config, utc_time, img_filename
+            )
+            
+            # Step 5: Generate comprehensive results
+            result = {
+                'status': 'SUCCESS',
+                'utc_time': utc_time,
+                'img_filename': img_filename,
+                'index': index,
+                'synthetic_img_path': str(synthetic_img_path),
+                'processed_img_path': str(processed_img_path) if 'processed_img_path' in locals() else None,
+                'template_count': len(template_paths),
+                'spice_data': self._convert_numpy_types(spice_data),
+                'photometric_params': self.photometric_params,
+                'processing_params': processing_params.to_dict() if processing_params else None,
+                'validation_result': validation_result.to_dict() if validation_result else None,
+                'distance_calculations': {
+                    'sun_phobos_distance': float(np.linalg.norm(spice_data["phobos"]["position"])),
+                    'calculated_intensity': float(self.calculate_distance_based_intensity(
+                        np.array(spice_data["sun"]["position"]),
+                        np.array(spice_data["phobos"]["position"])
+                    ))
+                }
+            }
+            
+            # Save blend file for debugging
+            corto.Utils.save_blend(state, f'enhanced_simulation_{index}_{img_filename.replace(".IMG", "")}')
+            
+            self.logger.info(f"Enhanced simulation completed successfully")
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error in enhanced simulation: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                'status': 'FAILED',
+                'error': str(e),
+                'utc_time': utc_time,
+                'img_filename': img_filename,
+                'index': index
+            }
+
+    def _convert_numpy_types(self, obj):
+        """Convert numpy types to Python native types for JSON serialization"""
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {key: self._convert_numpy_types(value) for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [self._convert_numpy_types(item) for item in obj]
+        return obj
+
+    def save_comprehensive_results(self, results: List[Dict], output_dir: str):
+        """Save comprehensive simulation and validation results"""
+        
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Save individual results
+        results_path = output_path / f"enhanced_simulation_results_{timestamp}.json"
+        with open(results_path, 'w') as f:
+            json.dump(self._convert_numpy_types(results), f, indent=4)
+        
+        # Save validation summary
+        validation_summary = self.validation_pipeline.get_validation_summary()
+        summary_path = output_path / f"validation_summary_{timestamp}.json"
+        with open(summary_path, 'w') as f:
+            json.dump(self._convert_numpy_types(validation_summary), f, indent=4)
+        
+        # Save post-processing statistics
+        processing_stats = self.post_processor.get_generation_statistics()
+        stats_path = output_path / f"post_processing_stats_{timestamp}.json"
+        with open(stats_path, 'w') as f:
+            json.dump(self._convert_numpy_types(processing_stats), f, indent=4)
+        
+        # Generate comprehensive report
+        report = self._generate_comprehensive_report(results, validation_summary, processing_stats)
+        report_path = output_path / f"comprehensive_report_{timestamp}.md"
+        with open(report_path, 'w') as f:
+            f.write(report)
+        
+        self.logger.info(f"Comprehensive results saved to: {output_path}")
+        return {
+            'results_path': str(results_path),
+            'summary_path': str(summary_path),
+            'stats_path': str(stats_path),
+            'report_path': str(report_path)
+        }
+
+    def _generate_comprehensive_report(self, results: List[Dict], 
+                                     validation_summary: Dict, 
+                                     processing_stats: Dict) -> str:
+        """Generate comprehensive markdown report"""
+        
+        successful_results = [r for r in results if r.get('status') == 'SUCCESS']
+        
+        report = f"""# Enhanced Photometric Simulation Report
+
+## Summary
+- **Total Simulations**: {len(results)}
+- **Successful Simulations**: {len(successful_results)}
+- **Success Rate**: {len(successful_results)/len(results)*100:.1f}%
+- **Timestamp**: {datetime.now().isoformat()}
+
+## Validation Pipeline Results
+- **Total Validations**: {validation_summary.get('total_validations', 0)}
+- **Successful Validations**: {validation_summary.get('successful_validations', 0)}
+- **Average NCC**: {validation_summary.get('average_metrics', {}).get('ncc', 0):.4f}
+- **Average NRMSE**: {validation_summary.get('average_metrics', {}).get('nrmse', 0):.4f}
+- **Average SSIM**: {validation_summary.get('average_metrics', {}).get('ssim', 0):.4f}
+- **Average Composite Score**: {validation_summary.get('average_metrics', {}).get('composite_score', 0):.4f}
+
+## Post-Processing Statistics
+- **Total Processed**: {processing_stats.get('total_processed', 0)}
+- **Domain Randomization Balance**: {processing_stats.get('balance_ratio', 0):.4f}
+- **Padding Distribution**: {processing_stats.get('padding_distribution', {})}
+- **Blob Strategy Distribution**: {processing_stats.get('blob_distribution', {})}
+
+## Distance-Based Photometric Calculations
+"""
+        
+        if successful_results:
+            distances = [r.get('distance_calculations', {}) for r in successful_results]
+            avg_distance = np.mean([d.get('sun_phobos_distance', 0) for d in distances])
+            avg_intensity = np.mean([d.get('calculated_intensity', 0) for d in distances])
+            
+            report += f"""- **Average Sun-Phobos Distance**: {avg_distance:.0f} km
+- **Average Calculated Intensity**: {avg_intensity:.2f}
+- **Distance Scaling Law**: {self.photometric_params['distance_scaling_law']}
+- **Base Intensity**: {self.photometric_params['sun_base_intensity']}
+
+"""
+        
+        report += f"""## CORTO Pipeline Compliance
+- **Figure 12 Post-Processing**: ✅ IMPLEMENTED
+- **Figure 15 Validation**: ✅ IMPLEMENTED  
+- **Figure 8 Noise Modeling**: ✅ IMPLEMENTED
+- **Appendix A Label Transformation**: ✅ IMPLEMENTED
+- **Domain Randomization**: ✅ IMPLEMENTED
+- **Distance-Based Photometrics**: ✅ IMPLEMENTED
+
+## Technical Details
+- **Camera Type**: {self.camera_type}
+- **Rendering Engine**: CYCLES
+- **Samples**: 256
+- **Target Size**: {self.post_processor.target_size}px
+- **Noise Pipeline Steps**: 8
+- **Template Generation**: Systematic
+
+---
+*Generated by Enhanced Photometric Simulator with complete CORTO pipeline integration*
+"""
+        
+        return report
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Initialize enhanced simulator
+    simulator = EnhancedPhotometricSimulator(camera_type='SRC')
+    
+    # Example simulation run
+    utc_time = "2019-06-07T10:46:42.8575Z"
+    real_img_path = "path/to/real/image.IMG"
+    img_filename = "test_image.IMG"
+    index = 0
+    
+    try:
+        # Run enhanced simulation with complete validation
+        result = simulator.run_enhanced_simulation_with_complete_validation(
+            utc_time, real_img_path, img_filename, index
+        )
+        
+        print(f"✅ Simulation result: {result['status']}")
+        if result['status'] == 'SUCCESS':
+            print(f"📊 Templates generated: {result['template_count']}")
+            print(f"🎯 Validation score: {result.get('validation_result', {}).get('composite_score', 'N/A')}")
+        
+        # Save comprehensive results
+        simulator.save_comprehensive_results([result], "output/enhanced_results")
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
