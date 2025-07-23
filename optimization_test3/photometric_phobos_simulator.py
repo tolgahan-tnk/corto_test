@@ -1,5 +1,4 @@
 """
-photometric_phobos_simulator.py
 Integrated Fixed Photometric Phobos Simulator
 All fixes integrated into the main file - no separate imports needed
 """
@@ -551,35 +550,35 @@ class FixedCORTOValidator:
             traceback.print_exc()
             return None
         
-        def get_validation_summary(self):
-            """Get summary of all validations"""
-            if not self.validation_results:
-                return {
-                    'total_validations': 0,
-                    'successful_validations': 0,
-                    'success_rate': 0,
-                    'average_composite_score': 0,
-                    'average_ssim': 0,
-                    'pds_processing_enabled': True,
-                    'transformation_alignment': 'FIXED',
-                    'mask_alignment_available': False
-                }
-            
-            total = len(self.validation_results)
-            successful = len([r for r in self.validation_results if r['validation_status'] == 'SUCCESS'])
-            avg_composite = np.mean([r['composite_score'] for r in self.validation_results])
-            avg_ssim = np.mean([r['best_ssim'] for r in self.validation_results])
-            
+    def get_validation_summary(self):
+        """Get summary of all validations"""
+        if not self.validation_results:
             return {
-                'total_validations': total,
-                'successful_validations': successful,
-                'success_rate': successful / total if total > 0 else 0,
-                'average_composite_score': avg_composite,
-                'average_ssim': avg_ssim,
+                'total_validations': 0,
+                'successful_validations': 0,
+                'success_rate': 0,
+                'average_composite_score': 0,
+                'average_ssim': 0,
                 'pds_processing_enabled': True,
                 'transformation_alignment': 'FIXED',
-                'mask_alignment_available': any(r.get('mask_alignment', False) for r in self.validation_results)
+                'mask_alignment_available': False
             }
+        
+        total = len(self.validation_results)
+        successful = len([r for r in self.validation_results if r['validation_status'] == 'SUCCESS'])
+        avg_composite = np.mean([r['composite_score'] for r in self.validation_results])
+        avg_ssim = np.mean([r['best_ssim'] for r in self.validation_results])
+        
+        return {
+            'total_validations': total,
+            'successful_validations': successful,
+            'success_rate': successful / total if total > 0 else 0,
+            'average_composite_score': avg_composite,
+            'average_ssim': avg_ssim,
+            'pds_processing_enabled': True,
+            'transformation_alignment': 'FIXED',
+            'mask_alignment_available': any(r.get('mask_alignment', False) for r in self.validation_results)
+        }
 
     def _template_matching_single(self, real_img, synthetic_img, mask_path):
         """Single template matching with optional mask"""
@@ -617,6 +616,82 @@ class FixedCORTOValidator:
             'mask_used': mask_used,
             'crop_location': max_loc
         }
+
+    def _create_noise_combinations(self):
+        """Create noise combinations as per CORTO Table 1"""
+        noise_combinations = []
+        
+        # Table 1 values from CORTO paper
+        gaussian_means = [0.01, 0.09, 0.17, 0.25]
+        gaussian_vars = [1e-5, 1e-4, 1e-3]
+        blur_values = [0.6, 0.8, 1.0, 1.2]
+        brightness_values = [1.00, 1.17, 1.33, 1.50]
+        
+        for g_mean in gaussian_means:
+            for g_var in gaussian_vars:
+                for blur in blur_values:
+                    for brightness in brightness_values:
+                        noise_combinations.append({
+                            'gaussian_mean': g_mean,
+                            'gaussian_var': g_var,
+                            'blur': blur,
+                            'brightness': brightness
+                        })
+        
+        return noise_combinations
+
+    def _apply_noise_combination(self, image, noise_params):
+        """Apply specific noise combination to image"""
+        result = image.copy().astype(np.float32)
+        
+        # Gaussian noise
+        noise = np.random.normal(
+            noise_params['gaussian_mean'], 
+            np.sqrt(noise_params['gaussian_var']), 
+            image.shape
+        )
+        result += noise
+        
+        # Blur
+        kernel_size = int(noise_params['blur'] * 2) * 2 + 1
+        result = cv2.GaussianBlur(result, (kernel_size, kernel_size), noise_params['blur'])
+        
+        # Brightness adjustment
+        result *= noise_params['brightness']
+        
+        return np.clip(result, 0, 255).astype(np.uint8)
+
+    def _template_matching_validation(self, real_img, template_imgs):
+        """Enhanced template matching following CORTO Figure 15"""
+        results = []
+        
+        for template_img in template_imgs:
+            # Normalized cross-correlation
+            correlation = cv2.matchTemplate(real_img, template_img, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(correlation)
+            
+            # Crop both images to maximize correlation
+            h, w = template_img.shape
+            top_left = max_loc
+            bottom_right = (top_left[0] + w, top_left[1] + h)
+            
+            cropped_real = real_img[top_left[1]:bottom_right[1], top_left[0]:bottom_right[0]]
+            
+            # NRMSE calculation
+            if cropped_real.shape == template_img.shape:
+                mse = np.mean((cropped_real.astype(np.float64) - template_img.astype(np.float64)) ** 2)
+                img_range = cropped_real.max() - cropped_real.min()
+                nrmse = np.sqrt(mse) / img_range if img_range > 0 else 0
+                
+                results.append({
+                    'template': template_img,
+                    'cropped_real': cropped_real,
+                    'ncc': max_val,
+                    'nrmse': nrmse,
+                    'crop_location': max_loc
+                })
+        
+        return results
 
 class EnhancedPhotometricPhobosSimulator:
     """Enhanced Photometric Phobos Simulator with FIXED CORTO Validation"""
@@ -1089,81 +1164,7 @@ class EnhancedPhotometricPhobosSimulator:
         
         return results_path, summary_path
 
-    def _create_noise_combinations(self):
-        """Create noise combinations as per CORTO Table 1"""
-        noise_combinations = []
-        
-        # Table 1 values from CORTO paper
-        gaussian_means = [0.01, 0.09, 0.17, 0.25]
-        gaussian_vars = [1e-5, 1e-4, 1e-3]
-        blur_values = [0.6, 0.8, 1.0, 1.2]
-        brightness_values = [1.00, 1.17, 1.33, 1.50]
-        
-        for g_mean in gaussian_means:
-            for g_var in gaussian_vars:
-                for blur in blur_values:
-                    for brightness in brightness_values:
-                        noise_combinations.append({
-                            'gaussian_mean': g_mean,
-                            'gaussian_var': g_var,
-                            'blur': blur,
-                            'brightness': brightness
-                        })
-        
-        return noise_combinations
 
-    def _apply_noise_combination(self, image, noise_params):
-        """Apply specific noise combination to image"""
-        result = image.copy().astype(np.float32)
-        
-        # Gaussian noise
-        noise = np.random.normal(
-            noise_params['gaussian_mean'], 
-            np.sqrt(noise_params['gaussian_var']), 
-            image.shape
-        )
-        result += noise
-        
-        # Blur
-        kernel_size = int(noise_params['blur'] * 2) * 2 + 1
-        result = cv2.GaussianBlur(result, (kernel_size, kernel_size), noise_params['blur'])
-        
-        # Brightness adjustment
-        result *= noise_params['brightness']
-        
-        return np.clip(result, 0, 255).astype(np.uint8)
-
-    def _template_matching_validation(self, real_img, template_imgs):
-        """Enhanced template matching following CORTO Figure 15"""
-        results = []
-        
-        for template_img in template_imgs:
-            # Normalized cross-correlation
-            correlation = cv2.matchTemplate(real_img, template_img, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, max_loc = cv2.minMaxLoc(correlation)
-            
-            # Crop both images to maximize correlation
-            h, w = template_img.shape
-            top_left = max_loc
-            bottom_right = (top_left[0] + w, top_left[1] + h)
-            
-            cropped_real = real_img[top_left[1]:bottom_right[1], top_left[0]:bottom_right[0]]
-            
-            # NRMSE calculation
-            if cropped_real.shape == template_img.shape:
-                mse = np.mean((cropped_real.astype(np.float64) - template_img.astype(np.float64)) ** 2)
-                img_range = cropped_real.max() - cropped_real.min()
-                nrmse = np.sqrt(mse) / img_range if img_range > 0 else 0
-                
-                results.append({
-                    'template': template_img,
-                    'cropped_real': cropped_real,
-                    'ncc': max_val,
-                    'nrmse': nrmse,
-                    'crop_location': max_loc
-                })
-        
-        return results
 
 
 def main(pds_data_path=None, max_simulations=None, camera_type='SRC'):
