@@ -1,4 +1,5 @@
 """
+photometric_phobos_simulator.py
 Integrated Fixed Photometric Phobos Simulator
 All fixes integrated into the main file - no separate imports needed
 """
