@@ -1,4 +1,5 @@
 """"
+INDEX.png ve proccesed_index.png'lerin düzgün gözüktüğü başka kod
 photometric_phobos_simulator.py
 Compact Integrated Fixed Photometric Phobos Simulator
 All fixes integrated into the main file - no separate imports needed
@@ -10,7 +11,7 @@ from datetime import datetime
 from skimage.metrics import structural_similarity as ssim
 from scipy.signal import correlate2d
 import argparse 
-
+import math
 
 #######SAME RANDOM VALUESSS##########
 np.random.seed(42)   
@@ -165,7 +166,7 @@ class CompactCORTOValidator:
             return 0.0
 
     def _apply_corto_pipeline_and_template_matching(self, real_img, synthetic_imgs, synthetic_img_paths):
-        """Combined CORTO pipeline application and template matching"""
+        """Combined CORTO pipeline application and template matching - CORTO PAPER COMPLIANT"""
         # Default labels
         labels = {'CoB': [real_img.shape[1]//2, real_img.shape[0]//2], 'range': 1000.0, 'phase_angle': 0.0}
         
@@ -194,18 +195,22 @@ class CompactCORTOValidator:
             
             synthetic_processed = cv2.cvtColor(synthetic_processed.astype(np.uint8), cv2.COLOR_RGB2GRAY) if len(synthetic_processed.shape) == 3 else synthetic_processed
             
-            # Template matching
+            # Template matching - CORTO Equation (1) equivalent
             correlation = cv2.matchTemplate(real_processed, synthetic_processed, cv2.TM_CCOEFF_NORMED)
             _, ncc, _, max_loc = cv2.minMaxLoc(correlation)
             
-            # Enhanced mask correlation
+            # Enhanced mask correlation (extra feature)
             mask_correlation, mask_used = self._find_mask_and_calculate_correlation(real_processed, synthetic_processed, img_path)
             ncc = max(ncc, mask_correlation)
             
-            # NRMSE
+            # ✅ DÜZELTME: CORTO Equation (2)'ye uygun NRMSE
             mse = np.mean((real_processed.astype(np.float64) - synthetic_processed.astype(np.float64)) ** 2)
-            img_range = real_processed.max() - real_processed.min()
-            nrmse = np.sqrt(mse) / img_range if img_range > 0 else 0
+            d = real_processed.size  # total number of pixels (CORTO Equation 2)
+            nrmse = np.sqrt(mse) / np.sqrt(d)  # NRMSE = sqrt(MSE) / sqrt(d)
+            
+            # ❌ ESKİ KOD (yanlış normalization):
+            # img_range = real_processed.max() - real_processed.min()
+            # nrmse = np.sqrt(mse) / img_range if img_range > 0 else 0
             
             template_results.append({
                 'index': i, 'real_processed': real_processed, 'synthetic_processed': synthetic_processed,
@@ -420,11 +425,12 @@ class CompactPDSProcessor:
 class CompactPhotometricSimulator:
     """Compact Photometric Phobos Simulator"""
     
-    def __init__(self, config_path=None, camera_type='SRC', pds_data_path=None, model="radiance"):
+    def __init__(self, config_path=None, camera_type='SRC', pds_data_path=None, model="radiance", output_scale="DN"):
         self.config = self._load_or_create_config(config_path)
         self.camera_type = camera_type
         self.pds_data_path = pds_data_path or self.config.get('pds_data_path', 'PDS_Data')
-        self.model = model    
+        self.model = model
+        self.output_scale = output_scale.upper()   # "DN" veya "ABS"
         
         # Initialize components
         self.spice_processor = SpiceDataProcessor(base_path=self.config['spice_data_path'])
@@ -440,51 +446,78 @@ class CompactPhotometricSimulator:
         
         print(f"✅ Compact simulator initialized with FIXED validation")
 
+
+
+    # 1)  EKLENTİ  ——  LUT kazancı   (sınıf içinde herhangi bir yere)
+    # ================================================================
     @staticmethod
+    def gain_L2_eff(exp_ms      : float,
+                    buffer_mode : str   = "BUFFER_8",
+                    release_id  : str   = "0148",
+                    T_degC      : float = 0.0) -> float:
+        """
+        SRC Level‑2 etkin LUT kazancı  g_eff  [e⁻ / DN8]
+        """
+        base     = 2.0e6 if buffer_mode == "BUFFER_8" else 0.25e6
+        gamma    = 0.45
+        exp_ref  = 84.672                          # ms
+        rel_corr = {"0146":0.93,"0147":0.97,"0148":1.00,
+                    "0149":0.93,"0150":1.08}.get(release_id, 1.0)
+        scale_T  = 1.0 + 0.01*T_degC              # +1 % / °C
+        return base*(exp_ref/exp_ms)**gamma*rel_corr*scale_T
+        # ================================================================
+
+
+    
+
     def compute_sun_strength_photon(
-            solar_distance_km: float,
-            exposure_time_s: float,
+            self,                        # <-- sınıf içi çağrı için
+            solar_distance_km : float,
+            exposure_time_s   : float,
             *,
-            lambda_eff=675e-9,
-            pixel_pitch=7e-6,
-            qe=0.07,
-            gain_e_per_dn_L0=40.0,
-            gain_e_per_dn_L2=1.5e6,       # Gwinner16, SRCAL LUT
-            ad_bits_L0=14,
-            return_mode="dn",             # 'radiance'|'electron'|'dn'
-            level="L2"                    # 'L0' (raw) or 'L2' (RDR)
+            buffer_mode       = "BUFFER_8",
+            release_id        = "0148",
+            instrument_temp   = 0.0,
+            lambda_eff        = 675e-9,   # m
+            pixel_pitch       = 7e-6,     # m
+            qe                = 0.07,     # e⁻/photon 0.07
+            gain_e_per_dn_L0  = 40.0,     # e⁻/DN14
+            level             = "L2",     # 'L0' | 'L2'
+            return_mode       = "radiance_rel"  # varsay.
     ):
-        """
-        Radiance / photon / DN converter for HRSC‑SRC.
-        * Level‑0 → fiziksel gain (40 e⁻/DN)
-        * Level‑2 → efektif on‑board LUT gain (~2 Me⁻/DN)
-        """
-        import math
         AU_KM, SOLC = 1.495978707e8, 1361.0
-        H, C, PI = 6.626e-34, 2.998e8, math.pi
+        H,C,PI      = 6.62607015e-34, 2.99792458e8, math.pi
 
-        dist_au = solar_distance_km / AU_KM
-        irradiance = SOLC / dist_au**2          # W m⁻²
-        radiance   = irradiance / PI            # W m⁻² sr⁻¹
-        if return_mode == "radiance":
-            return radiance
+        # ---- Güneş akısı -------------------------------------------------
+        irr   = SOLC / (solar_distance_km / AU_KM)**2          # W m⁻²
+        E_ph  = H*C / lambda_eff
+        N_ph  = irr/E_ph * exposure_time_s                     # photon m⁻²
+        e_min = N_ph * (pixel_pitch**2) * qe                   # e⁻
 
-        # photon & electron count (ort. piksel)
-        e_photon   = H*C/lambda_eff
-        photon_flux = irradiance / e_photon
-        photons = photon_flux * exposure_time_s
-        e_minus = photons * (pixel_pitch**2) * qe
-        if return_mode == "electron":
-            return e_minus
-
-        # choose gain by level
-        gain = gain_e_per_dn_L0 if level == "L0" else gain_e_per_dn_L2
-        dn_linear = e_minus / gain * 0.176             # DN before bit‑depth mapping
-
-        # map to 8‑bit if needed
+        # --------------------------- Level‑0 ------------------------------
         if level == "L0":
-            dn_linear *= 255/(2**ad_bits_L0 - 1)
-        return dn_linear
+            if return_mode == "electron":
+                return e_min
+            dn14 = e_min / gain_e_per_dn_L0
+            if return_mode in ("dn", "radiance_rel"):
+                return dn14
+            K0 = gain_e_per_dn_L0*E_ph/((pixel_pitch**2)*exposure_time_s*qe)
+            return dn14 * K0                                   # radiance_abs
+
+        # --------------------------- Level‑2 ------------------------------
+        g_eff  = self.gain_L2_eff(exposure_time_s*1e3,
+                                buffer_mode, release_id, instrument_temp)
+        dn_rel = e_min / g_eff
+
+        if return_mode in ("dn", "radiance_rel"):
+            return dn_rel
+        if return_mode == "electron":
+            return e_min
+
+        K = g_eff*E_ph / ((pixel_pitch**2)*exposure_time_s*qe)
+        return dn_rel * K                                      # radiance_abs
+
+
 
 
     def _load_or_create_config(self, config_path):
@@ -500,7 +533,7 @@ class CompactPhotometricSimulator:
             'spice_data_path': str(base_dir / 'spice_kernels'),
             'pds_data_path': str(base_dir / 'PDS_Data'),
             'real_images_path': str(base_dir / 'real_hrsc_images'),
-            'body_files': ['g_phobos_287m_spc_0000n00000_v002.obj', 'Mars_65k.obj', 'g_deimos_162m_spc_0000n00000_v001.obj'],
+            'body_files': ['g_phobos_018m_spc_0000n00000_v002.obj', 'Mars_65k.obj', 'g_deimos_162m_spc_0000n00000_v001.obj'],
             'scene_file': 'scene_mmx.json',
             'geometry_file': 'geometry_mmx.json'
         }
@@ -516,57 +549,57 @@ class CompactPhotometricSimulator:
                 return {'fov': 11.9, 'res_x': 5184, 'res_y': 1, 'film_exposure': exposure_time_s, 'sensor': 'BW', 'clip_start': 0.1, 'clip_end': 10000.0, 'bit_encoding': '16', 'viewtransform': 'Standard', 'K': [[2500.0, 0, 2592.0], [0, 2500.0, 0.5], [0, 0, 1]]}
 
     def _get_photometric_params(self,
-                                exposure_time_s: float = 1.0,
-                                solar_distance_km: float | None = None,
-                                model: str = "radiance"):
+                                exposure_time_s: float,
+                                solar_distance_km: float | None = None):
         """
-        Photometric parameters based on physical solar constant.
+        Tek kaynaktan iki ölçek:
+        • sun_strength_abs  – W m⁻² sr⁻¹
+        • dn_rel            – 0‑255 DN₈
+        self.output_scale göre sadece biri sun_strength olarak dönüyor.
         """
-        # ------------------------------------------------------------
-        # 1) Güneş–Phobos mesafesi
-        # ------------------------------------------------------------
-        solar_distance_km = solar_distance_km or AU_KM          # varsayılan 1 AU
-        solar_distance_au = solar_distance_km / AU_KM           # ➊  ← HATA buradaydı
-        irradiance        = SOLAR_CONSTANT_WM2 / solar_distance_au**2  # ➋
+        solar_distance_km = solar_distance_km or AU_KM
+        solar_distance_au = solar_distance_km / AU_KM
+        irradiance = SOLAR_CONSTANT_WM2 / solar_distance_au**2        # W m⁻²
 
-        # ------------------------------------------------------------
-        # 2) Güç/radyans (veya elektron) hesabı
-        # ------------------------------------------------------------
-        sun_strength = self.compute_sun_strength_photon(
-            solar_distance_km,
-            exposure_time_s,
-            return_mode='dn'
-        )
+        # 1) Mutlak radyans
+        L_abs = self.compute_sun_strength_photon(
+                    solar_distance_km, exposure_time_s,
+                    return_mode="radiance_abs")
 
-        # ------------------------------------------------------------
-        # 3) DEBUG çıktısı
-        # ------------------------------------------------------------
+        # 2) Aynı koşulların DN (0‑255) karşılığı
+        dn_rel = self.compute_sun_strength_photon(
+                    solar_distance_km, exposure_time_s,
+                    return_mode="dn")
+
+        K = L_abs / dn_rel        # ≈ 2.0 – 2.3   abs→DN dönüştürücü
+
+        # 3) Hangisi çıktı olacak?
+        if self.output_scale == "ABS":
+            sun_strength = L_abs                     # W m⁻² sr⁻¹
+        else:  # "DN"
+            sun_strength = dn_rel * 0.125             # 0‑255
+
+        # 4) DEBUG
+        scale_txt = "W m⁻² sr⁻¹" if self.output_scale == "ABS" else "DN₈"
         print("   🌞 Solar const model:")
-        print(f"      Distance: {solar_distance_km/1e6:7.3f} Mkm "
-            f"({solar_distance_au:4.3f} AU)")
-        print(f"      Irradiance @Phobos: {irradiance:6.1f} W/m²")
-        print(f"      Exposure time: {exposure_time_s:.4f} s")
-        print(f"      Sun strength ({model}): {sun_strength:.3e}")
+        print(f"      Distance       : {solar_distance_km/1e6:7.3f} Mkm "
+            f"({solar_distance_au:4.3f} AU)")
+        print(f"      Irradiance     : {irradiance:6.1f} W m⁻²")
+        print(f"      Exposure time  : {exposure_time_s:.4f} s")
+        print(f"      Sun strength   : {sun_strength:.3f}  {scale_txt}")
+        if self.output_scale == "ABS":
+            print(f"      DN (rel)       : {dn_rel:.2f} DN₈   →  K = {K:.3f}")
 
-        # ------------------------------------------------------------
-        # 4) Fonksiyon çıktısı
-        # ------------------------------------------------------------
         return {
-            "sun_strength"       : sun_strength,
-            "model"              : model,
-            "phobos_albedo"      : 0.5, #0.068,
-            "mars_albedo"        : 0.170,
-            "deimos_albedo"      : 0.068,
-            "sensor_aging_factor": 0.95,
-            "brdf_model"         : "principled",
-            "brdf_roughness"     : 0.5,
-            "gamma_correction"   : 1.0,
-            "exposure_time"      : exposure_time_s,
-            "solar_distance_km"  : solar_distance_km,
-            "solar_distance_au"  : solar_distance_au,
-            "irradiance_Wm2"     : irradiance,
+            "sun_strength"      : sun_strength,   # ölçek seçimine göre
+            "sun_strength_abs"  : L_abs,          # daima döner (isterseniz kullanın)
+            "dn_rel"            : dn_rel,
+            "K_factor"          : K,
+            "irradiance_Wm2"    : irradiance,
+            "exposure_time"     : exposure_time_s,
+            "solar_distance_km" : solar_distance_km,
+            "solar_distance_au" : solar_distance_au,
         }
-
 
     def setup_scene_and_environment(self, utc_time, index, exposure_time_s):
         """scene + environment (foton modeli entegre)"""
@@ -582,17 +615,16 @@ class CompactPhotometricSimulator:
         except Exception:
             spice_data = {...}                      #  ↞ sizin fallback dict’iniz
             solar_distance_km = 149_597_870.7       # 1 AU
-
         # ------------------------------------------------------------------
         # 2) Fotometrik parametreleri hesapla
-        #    (self.model = "radiance" veya "electron")
+        #    (output_scale seçimine göre DN veya ABS döner)
         # ------------------------------------------------------------------
         photometric_params = self._get_photometric_params(
             exposure_time_s=exposure_time_s,
-            solar_distance_km=solar_distance_km,
-            model=self.model
+            solar_distance_km=solar_distance_km
         )
-        sun_energy = float(photometric_params["sun_strength"])
+        sun_energy = photometric_params["sun_strength"]
+
 
         # ------------------------------------------------------------------
         # 3) Scene / geometry JSON’larını yaz
@@ -682,10 +714,10 @@ class CompactPhotometricSimulator:
 
     def _add_paths_to_state(self, state):
         """Add required paths to state"""
-        state.add_path('albedo_path_1', os.path.join(state.path["input_path"], 'body', 'albedo', 'PPhobos grayscale_0_070_scaled.jpg'))
+        state.add_path('albedo_path_1', os.path.join(state.path["input_path"], 'body', 'albedo', 'Phobos grayscale.jpg'))
         state.add_path('albedo_path_2', os.path.join(state.path["input_path"], 'body', 'albedo', 'mars_1k_color.jpg'))
         state.add_path('albedo_path_3', os.path.join(state.path["input_path"], 'body', 'albedo', 'Deimos grayscale.jpg'))
-        state.add_path('uv_data_path_1', os.path.join(state.path["input_path"], 'body', 'uv data', 'g_phobos_287m_spc_0000n00000_v002.json'))
+        state.add_path('uv_data_path_1', os.path.join(state.path["input_path"], 'body', 'uv data', 'g_phobos_018m_spc_0000n00000_v002.json'))
         state.add_path('uv_data_path_2', os.path.join(state.path["input_path"], 'body', 'uv data', 'Mars_65k.json'))
         state.add_path('uv_data_path_3', os.path.join(state.path["input_path"], 'body', 'uv data', 'g_deimos_162m_spc_0000n00000_v001.json'))
 
@@ -855,7 +887,12 @@ def main(pds_data_path=None, max_simulations=None, camera_type='SRC'):
     print("Compact Photometric Phobos Simulator with FIXED CORTO Validation")
     print("="*80)
     
-    simulator = CompactPhotometricSimulator(camera_type=args.camera_type, pds_data_path=args.pds_data_path, model=args.model)
+    simulator = CompactPhotometricSimulator(
+        camera_type   = args.camera_type,
+        pds_data_path = args.pds_data_path,
+        model         = args.model,          # ← self.model burada set edilir
+        output_scale  = args.output_scale    # ← yeni parametre
+    )
     
     simulation_results, validation_summary = simulator.run_complete_pipeline(pds_data_path, max_simulations)
     
@@ -879,14 +916,18 @@ if __name__ == "__main__":
     parser.add_argument("--model", default="radiance",
                         choices=["radiance", "electron"],
                         help="Sun‑strength modeli: 'radiance' (irradiance/π) veya "
-                             "'electron' (e- per pixel)")
+                            "'electron' (e- per pixel)")
+    parser.add_argument("--output_scale", default="DN",
+        choices=["DN", "ABS"],
+        help="Render görüntüsünü Level‑2 DN8 (0‑255) veya "
+            "mutlak radyans (W m⁻² sr⁻¹) olarak kaydet.")
 
-    args = parser.parse_args()            # ← artık 'args' var
-
+    args = parser.parse_args()
     print(f"Starting simulator with:\n  PDS path  : {args.pds_data_path}"
-          f"\n  Max sims  : {args.max_simulations}"
-          f"\n  Camera    : {args.camera_type}"
-          f"\n  Model     : {args.model}")
+        f"\n  Max sims  : {args.max_simulations}"
+        f"\n  Camera    : {args.camera_type}"
+        f"\n  Model     : {args.model}"
+        f"\n  Output    : {args.output_scale}")
 
     simulator = CompactPhotometricSimulator(
         camera_type   = args.camera_type,
