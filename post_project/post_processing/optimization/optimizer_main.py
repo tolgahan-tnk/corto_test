@@ -6,15 +6,23 @@ optimizer_main.py
 Main script for photometric parameter optimization.
 
 Usage:
-    python optimizer_main.py --algorithm pso --img-metadata img_metadata.json
+    # Automatic PDS scanning
+    python optimizer_main.py --algorithm pso --pds-dir PDS_Data
+    
+    # Limit to first 3 images
+    python optimizer_main.py --algorithm pso --pds-dir PDS_Data --max-images 3
+    
+    # Select specific images
+    python optimizer_main.py --algorithm pso --pds-dir PDS_Data --img-pattern "H9463*"
 """
 
 import argparse
 import json
 import sys
 from pathlib import Path
-from typing import List, Dict
 import numpy as np
+import pandas as pd
+from typing import List, Dict
 
 from optimization_helper import (
     OptimizationLogger,
@@ -26,32 +34,144 @@ from optimization_helper import (
 from PSO import run_pso
 from Genetic import run_genetic
 
+# Add parent directory to path for phobos_data imports
+sys.path.append(str(Path(__file__).parent.parent))
+from phobos_data import CompactPDSProcessor, HAS_SPICE, SpiceDataProcessor
+
 
 # ============================================================================
-# IMG METADATA LOADING
+# PDS SCANNING AND METADATA EXTRACTION
 # ============================================================================
 
-def load_img_metadata(metadata_file: Path) -> List[Dict]:
+def scan_pds_directory(pds_dir: Path,
+                      max_images: int = None,
+                      img_pattern: str = None) -> List[Dict]:
     """
-    Load IMG metadata from JSON file.
+    Automatically scan PDS_Data directory and extract metadata.
     
-    Expected format:
-    {
-      "images": [
-        {
-          "filename": "H9463_0050_SR2.IMG",
-          "utc_time": "2019-06-07T10:46:42.8575Z",
-          "solar_distance_km": 228000000.0,
-          "pds_path": "PDS_Data/H9463_0050_SR2.IMG"
-        },
-        ...
-      ]
-    }
+    This function:
+    1. Uses CompactPDSProcessor to scan all IMG files
+    2. Extracts UTC times from PDS labels
+    3. Queries SPICE for solar distances
+    4. Creates img_info_list automatically
+    
+    Args:
+        pds_dir: Path to PDS_Data directory
+        max_images: Maximum number of images to process (optional)
+        img_pattern: Glob pattern to filter IMG files (optional, e.g., "H9463*")
+        
+    Returns:
+        List of img_info dictionaries with:
+        - filename: IMG filename
+        - utc_time: UTC timestamp from PDS label
+        - solar_distance_km: Solar distance from SPICE
+        - pds_path: Full path to IMG file
+        
+    Example:
+        >>> img_list = scan_pds_directory(Path("PDS_Data"), max_images=3)
+        >>> print(f"Found {len(img_list)} images")
     """
-    with open(metadata_file) as f:
-        data = json.load(f)
+    print("\n" + "="*80)
+    print("SCANNING PDS DIRECTORY")
+    print("="*80)
+    print(f"Directory: {pds_dir}")
     
-    return data['images']
+    if not pds_dir.exists():
+        raise FileNotFoundError(f"PDS directory not found: {pds_dir}")
+    
+    # Use CompactPDSProcessor to scan directory
+    print("\nStep 1: Parsing PDS IMG files...")
+    processor = CompactPDSProcessor(pds_dir)
+    df = processor.parse_dir()
+    
+    if df.empty:
+        raise RuntimeError(f"No IMG files found in {pds_dir}")
+    
+    print(f"  Found {len(df)} IMG files")
+    
+    # Apply filters
+    if img_pattern:
+        print(f"\nStep 2: Filtering by pattern '{img_pattern}'...")
+        import fnmatch
+        mask = df['file_name'].apply(lambda x: fnmatch.fnmatch(x, img_pattern))
+        df = df[mask].copy()
+        print(f"  Matched {len(df)} files")
+    
+    if max_images is not None and len(df) > max_images:
+        print(f"\nStep 3: Limiting to {max_images} images...")
+        df = df.head(max_images).copy()
+    
+    # Filter out images without valid UTC times
+    print("\nStep 4: Validating UTC times...")
+    before_count = len(df)
+    df = df[df['UTC_MEAN_TIME'].notna()].copy()
+    after_count = len(df)
+    
+    if after_count < before_count:
+        print(f"  ⚠️ Removed {before_count - after_count} images with invalid UTC times")
+    
+    if df.empty:
+        raise RuntimeError("No IMG files with valid UTC timestamps found")
+    
+    print(f"  Valid images: {len(df)}")
+    
+    # Query SPICE for solar distances
+    print("\nStep 5: Querying SPICE for solar distances...")
+    
+    if not HAS_SPICE:
+        raise RuntimeError(
+            "❌ SPICE is required for optimization but not available!\n"
+            "Please install SPICE dependencies:\n"
+            "  pip install spiceypy\n"
+            "And ensure spice_data_processor.py is available."
+        )
+    
+    sdp = SpiceDataProcessor()
+    img_info_list = []
+    
+    for idx, row in df.iterrows():
+        img_name = row['file_name']
+        utc_time = row['UTC_MEAN_TIME']
+        img_path = row['file_path']
+        
+        print(f"  [{idx+1}/{len(df)}] {img_name}: {utc_time}", end="")
+        
+        try:
+            # Query SPICE for this UTC time
+            spice_data = sdp.get_spice_data(utc_time)
+            solar_distance_km = float(spice_data['distances']['sun_to_phobos'])
+            
+            img_info = {
+                'filename': img_name,
+                'utc_time': utc_time,
+                'solar_distance_km': solar_distance_km,
+                'pds_path': img_path
+            }
+            
+            img_info_list.append(img_info)
+            print(f" → {solar_distance_km:.0f} km ✓")
+            
+        except Exception as e:
+            print(f" → SPICE query failed: {e}")
+            print(f"     Skipping {img_name}")
+            continue
+    
+    if not img_info_list:
+        raise RuntimeError("No images could be processed successfully")
+    
+    # Summary
+    print("\n" + "="*80)
+    print("PDS SCAN COMPLETE")
+    print("="*80)
+    print(f"Total images ready for optimization: {len(img_info_list)}")
+    print("\nImages:")
+    for i, info in enumerate(img_info_list, 1):
+        print(f"  {i}. {info['filename']}")
+        print(f"     UTC: {info['utc_time']}")
+        print(f"     Solar distance: {info['solar_distance_km']:.0f} km")
+    print("="*80 + "\n")
+    
+    return img_info_list
 
 
 # ============================================================================
@@ -136,52 +256,150 @@ def create_objective_function(config: Dict, img_info_list: List[Dict]):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Photometric Parameter Optimization",
+        description="Photometric Parameter Optimization with Automatic PDS Scanning",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # PSO with metadata file
-  python optimizer_main.py --algorithm pso --img-metadata img_metadata.json
+  # Automatic scanning of all IMG files in PDS_Data
+  python optimizer_main.py --algorithm pso --pds-dir PDS_Data
   
-  # Genetic Algorithm with config
-  python optimizer_main.py --algorithm genetic --config my_config.json
+  # Limit to first 3 images
+  python optimizer_main.py --algorithm pso --pds-dir PDS_Data --max-images 3
+  
+  # Filter by pattern
+  python optimizer_main.py --algorithm pso --pds-dir PDS_Data --img-pattern "H9463*"
+  
+  # Genetic Algorithm with config file
+  python optimizer_main.py --algorithm genetic --config my_config.json --pds-dir PDS_Data
   
   # Custom settings
-  python optimizer_main.py --algorithm pso --img-metadata imgs.json --iterations 50 --population 20
+  python optimizer_main.py \\
+      --algorithm pso \\
+      --pds-dir PDS_Data \\
+      --max-images 5 \\
+      --iterations 50 \\
+      --population 20 \\
+      --objective ssim \\
+      --mode cropped
         """
     )
     
-    parser.add_argument('--algorithm', choices=['pso', 'genetic', 'ga'], 
-                       default='pso', help='Optimization algorithm')
-    parser.add_argument('--config', type=str, help='JSON configuration file')
-    parser.add_argument('--img-metadata', type=str, required=True,
-                       help='JSON file with IMG metadata')
-    parser.add_argument('--objective', choices=['ssim', 'rmse', 'nmrse', 'combined'],
-                       default='ssim')
-    parser.add_argument('--mode', choices=['cropped', 'uncropped'], default='cropped')
-    parser.add_argument('--aggregation', choices=['mean', 'median', 'max'], default='mean')
-    parser.add_argument('--output', type=str, help='Output directory')
-    parser.add_argument('--name', type=str, help='Experiment name')
-    parser.add_argument('--iterations', type=int)
-    parser.add_argument('--population', type=int)
-    parser.add_argument('--seed', type=int)
-    parser.add_argument('--verbose', action='store_true', help='Verbose evaluation')
+    # Required arguments
+    parser.add_argument(
+        '--pds-dir',
+        type=str,
+        default='PDS_Data',
+        help='PDS IMG directory to scan (default: PDS_Data)'
+    )
+    
+    # Algorithm selection
+    parser.add_argument(
+        '--algorithm',
+        choices=['pso', 'genetic', 'ga'],
+        default='pso',
+        help='Optimization algorithm (default: pso)'
+    )
+    
+    parser.add_argument(
+        '--config',
+        type=str,
+        help='JSON configuration file (optional)'
+    )
+    
+    # Image selection
+    parser.add_argument(
+        '--max-images',
+        type=int,
+        help='Maximum number of images to process'
+    )
+    
+    parser.add_argument(
+        '--img-pattern',
+        type=str,
+        help='Glob pattern to filter IMG files (e.g., "H9463*", "HF*")'
+    )
+    
+    # Objective function settings
+    parser.add_argument(
+        '--objective',
+        choices=['ssim', 'rmse', 'nmrse', 'combined'],
+        default='ssim',
+        help='Objective function type (default: ssim)'
+    )
+    
+    parser.add_argument(
+        '--mode',
+        choices=['cropped', 'uncropped'],
+        default='cropped',
+        help='Evaluation mode (default: cropped)'
+    )
+    
+    parser.add_argument(
+        '--aggregation',
+        choices=['mean', 'median', 'max'],
+        default='mean',
+        help='Multi-image aggregation method (default: mean)'
+    )
+    
+    # Output settings
+    parser.add_argument(
+        '--output',
+        type=str,
+        help='Output directory'
+    )
+    
+    parser.add_argument(
+        '--name',
+        type=str,
+        help='Experiment name'
+    )
+    
+    # Algorithm parameters
+    parser.add_argument(
+        '--iterations',
+        type=int,
+        help='Number of iterations/generations'
+    )
+    
+    parser.add_argument(
+        '--population',
+        type=int,
+        help='Population/swarm size'
+    )
+    
+    parser.add_argument(
+        '--seed',
+        type=int,
+        help='Random seed'
+    )
+    
+    parser.add_argument(
+        '--verbose',
+        action='store_true',
+        help='Verbose evaluation output'
+    )
     
     args = parser.parse_args()
     
-    # Load config
+    # ========== Load Configuration ==========
     config = DEFAULT_CONFIG.copy()
     
     if args.config:
-        with open(args.config) as f:
+        config_path = Path(args.config)
+        if not config_path.exists():
+            print(f"Error: Config file not found: {args.config}")
+            sys.exit(1)
+        
+        with open(config_path) as f:
             user_config = json.load(f)
+        
         for key, value in user_config.items():
             if isinstance(value, dict) and key in config:
                 config[key].update(value)
             else:
                 config[key] = value
     
-    # Override with args
+    # Override with command-line arguments
     if args.algorithm:
         config['algorithm'] = args.algorithm
     if args.objective:
@@ -214,33 +432,35 @@ Examples:
     if args.seed:
         config[algorithm_key]['seed'] = args.seed
     
-    # Load IMG metadata
-    metadata_file = Path(args.img_metadata)
-    if not metadata_file.exists():
-        print(f"Error: Metadata file not found: {args.img_metadata}")
+    # ========== Scan PDS Directory ==========
+    try:
+        img_info_list = scan_pds_directory(
+            pds_dir=Path(args.pds_dir),
+            max_images=args.max_images,
+            img_pattern=args.img_pattern
+        )
+    except Exception as e:
+        print(f"\n❌ Error scanning PDS directory: {e}")
         sys.exit(1)
     
-    img_info_list = load_img_metadata(metadata_file)
-    
-    if not img_info_list:
-        print("Error: No images in metadata file")
-        sys.exit(1)
-    
-    # Initialize logger
+    # ========== Initialize Logger ==========
     output_dir = Path(config['output_dir'])
     experiment_name = config['experiment_name']
     
     logger = OptimizationLogger(output_dir, experiment_name)
     logger.set_config(config)
     
-    # Print config
+    # ========== Print Configuration ==========
     logger.log("\n" + "="*80)
     logger.log("PHOTOMETRIC PARAMETER OPTIMIZATION")
     logger.log("="*80)
     
-    logger.log(f"\nImages: {len(img_info_list)}")
+    logger.log(f"\nPDS Directory: {args.pds_dir}")
+    logger.log(f"Images: {len(img_info_list)}")
     for img_info in img_info_list:
         logger.log(f"  - {img_info['filename']}")
+        logger.log(f"    UTC: {img_info['utc_time']}")
+        logger.log(f"    Solar distance: {img_info['solar_distance_km']:.0f} km")
     
     logger.log(f"\nObjective: {config['objective_type']}")
     logger.log(f"Mode: {config['evaluation_mode']}")
@@ -251,10 +471,10 @@ Examples:
     for name, (lower, upper) in PARAMETER_BOUNDS.items():
         logger.log(f"  {name:<15}: [{lower:.4f}, {upper:.4f}]")
     
-    # Create objective function
+    # ========== Create Objective Function ==========
     objective_function = create_objective_function(config, img_info_list)
     
-    # Run optimization
+    # ========== Run Optimization ==========
     try:
         algorithm = config['algorithm'].lower()
         
@@ -277,7 +497,7 @@ Examples:
         else:
             raise ValueError(f"Unknown algorithm: {algorithm}")
         
-        # Save results
+        # ========== Save Results ==========
         logger.log("\n" + "="*80)
         logger.log("FINAL RESULTS")
         logger.log("="*80)
@@ -291,11 +511,12 @@ Examples:
         if config['save_plots']:
             logger.plot_convergence()
         
-        # Save final results
+        # Save final results with IMG info
         final_results_file = output_dir / f"{experiment_name}_{logger.timestamp}_final.json"
         with open(final_results_file, 'w') as f:
             json.dump({
                 'config': config,
+                'images': img_info_list,
                 'results': {
                     'best_objective': float(results['best_objective']),
                     'best_params': results['best_params'].tolist(),
@@ -323,10 +544,25 @@ if __name__ == "__main__":
         print("="*80)
         print("PHOTOMETRIC PARAMETER OPTIMIZATION")
         print("="*80)
+        print("\nThis tool optimizes photometric parameters using PDS IMG files.")
         print("\nUsage:")
-        print("  python optimizer_main.py --algorithm pso --img-metadata <FILE>")
+        print("  python optimizer_main.py --algorithm pso --pds-dir PDS_Data")
         print("\nFor help:")
         print("  python optimizer_main.py --help")
+        print("\nExamples:")
+        print("  # Process first 3 images")
+        print("  python optimizer_main.py --pds-dir PDS_Data --max-images 3")
+        print()
+        print("  # Filter by pattern")
+        print("  python optimizer_main.py --pds-dir PDS_Data --img-pattern 'H9463*'")
+        print()
+        print("  # Full optimization")
+        print("  python optimizer_main.py \\")
+        print("      --algorithm pso \\")
+        print("      --pds-dir PDS_Data \\")
+        print("      --max-images 5 \\")
+        print("      --iterations 50 \\")
+        print("      --population 20")
         print("="*80)
     else:
         main()
