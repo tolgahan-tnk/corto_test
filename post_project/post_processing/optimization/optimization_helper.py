@@ -138,6 +138,17 @@ def evaluate_params_with_rendering(
     """
     global render_synthetic_for_params
     
+    # ============ IMPORT'LAR BURAYA ============
+    from PIL import Image
+    import numpy as np
+    import shutil
+    import json
+    from pathlib import Path
+    from pds_processor import load_pds_image_data, filter_hot_pixels
+    from metrics_evaluator import normalize_image
+    from quick_evaluator import extract_pds_clip_params
+    # ==========================================
+    
     # Lazy import to avoid circular dependency
     if render_synthetic_for_params is None:
         from corto_renderer import render_synthetic_for_params as render_func
@@ -174,8 +185,57 @@ def evaluate_params_with_rendering(
             print(f"Error: Some renders failed for particle {particle_id}")
             return np.inf
         
+        # ============ CLIP SYNTHETIC TO PDS DIMENSIONS ============
+        if 'pds_path' in img_info_list[0]:
+            if verbose:
+                print(f"\nClipping synthetic images to PDS dimensions...")
+            
+            pds_params = extract_pds_clip_params(Path(img_info_list[0]['pds_path']))
+            
+            if verbose:
+                print(f"  PDS Clip Parameters:")
+                print(f"    col_off={pds_params['col_off']}, row_off={pds_params['row_off']}")
+                print(f"    width={pds_params['width']}, height={pds_params['height']}")
+            
+            clipped_files = []
+            for synth_file in synthetic_files:
+                # Load as uint16 PNG (Blender output)
+                synth_img = np.array(Image.open(synth_file))
+                
+                # Normalize to [0, 1] BEFORE clipping
+                if synth_img.dtype == np.uint16:
+                    synth_img = synth_img.astype(np.float32) / 65535.0
+                elif synth_img.dtype == np.uint8:
+                    synth_img = synth_img.astype(np.float32) / 255.0
+                else:
+                    synth_img = synth_img.astype(np.float32)
+                
+                # Clip to [0, 1] range
+                synth_img = np.clip(synth_img, 0.0, 1.0)
+                
+                # Clip to PDS dimensions
+                col_off = pds_params['col_off']
+                row_off = pds_params['row_off']
+                width = pds_params['width']
+                height = pds_params['height']
+                
+                synth_clipped = synth_img[row_off:row_off+height, col_off:col_off+width]
+                
+                # Save as float32 TIFF in [0,1] range
+                clipped_path = synth_file.parent / f"{synth_file.stem}_clipped.tiff"
+                Image.fromarray(synth_clipped, mode='F').save(clipped_path, format='TIFF')
+                clipped_files.append(clipped_path)
+                
+                if verbose:
+                    print(f"  Clipped {synth_file.name}: {synth_img.shape} → {synth_clipped.shape}")
+                    print(f"    Range: [{synth_clipped.min():.4f}, {synth_clipped.max():.4f}]")
+            
+            synthetic_files = clipped_files
+        # =============================================================
+        
         # EVALUATE each pair
         objectives = []
+        results_list = []  # Store results for later inspection
         
         for i, (img_info, synthetic_file) in enumerate(zip(img_info_list, synthetic_files)):
             if verbose:
@@ -190,12 +250,15 @@ def evaluate_params_with_rendering(
                 verbose=verbose
             )
             
+            results_list.append(results)  # Save for inspection
+            
             if mode not in results:
                 objectives.append(np.inf)
                 continue
             
+            # Calculate objective
             if objective_type == 'ssim':
-                obj_val = -results[mode]['best_ssim']
+                obj_val = -results[mode]['best_ssim']  # Negative because we minimize
             elif objective_type == 'rmse':
                 obj_val = results[mode]['best_rmse']
             elif objective_type == 'nmrse':
@@ -226,6 +289,148 @@ def evaluate_params_with_rendering(
         
         if verbose:
             print(f"\nFinal Objective: {final_obj:.6f}\n")
+        
+        # ============ SAVE BEST K IMAGES FOR INSPECTION ============
+        try:
+            # Create inspection directory
+            from metrics_evaluator import detect_masked_regions, crop_to_valid_region
+
+            # Create inspection directory
+            inspection_dir = particle_temp_dir / "best_k_inspection"
+            inspection_dir.mkdir(parents=True, exist_ok=True)
+
+            # For each IMG, save best k images
+            for i, (img_info, synthetic_file, result_dict) in enumerate(zip(img_info_list, synthetic_files, results_list)):
+                if mode not in result_dict:
+                    continue
+                
+                img_stem = Path(img_info['filename']).stem
+                
+                # Load synthetic clipped (already normalized [0,1])
+                synth_clipped = np.array(Image.open(synthetic_file), dtype=np.float32)
+                
+                # Detect masked regions and get valid mask (for cropped mode)
+                if mode == "cropped":
+                    valid_mask = detect_masked_regions(synth_clipped, buffer_percent=5.0)
+                
+                # Best SSIM k
+                best_ssim_k = result_dict[mode].get('best_ssim_k')
+                if best_ssim_k is not None:
+                    try:
+                        # Load and normalize real at best SSIM k
+                        raw_img, _ = load_pds_image_data(Path(img_info['pds_path']))
+                        filtered_img, _, _ = filter_hot_pixels(raw_img)
+                        real_norm_ssim = normalize_image(filtered_img, low_p=float(best_ssim_k), high_p=100.0)
+                        
+                        # Clip to PDS dimensions
+                        if 'pds_path' in img_info:
+                            pds_params = extract_pds_clip_params(Path(img_info['pds_path']))
+                            real_norm_ssim = real_norm_ssim[
+                                pds_params['row_off']:pds_params['row_off']+pds_params['height'],
+                                pds_params['col_off']:pds_params['col_off']+pds_params['width']
+                            ]
+                        
+                        # Apply CROPPING if in cropped mode
+                        if mode == "cropped":
+                            real_norm_ssim, synth_for_ssim = crop_to_valid_region(
+                                real_norm_ssim, synth_clipped, valid_mask
+                            )
+                        else:
+                            synth_for_ssim = synth_clipped
+                        
+                        # Save CLIPPED+CROPPED real
+                        real_ssim_path = inspection_dir / f"{img_stem}_real_norm_k{best_ssim_k:02d}_bestSSIM_{mode}.tif"
+                        Image.fromarray(real_norm_ssim, mode='F').save(real_ssim_path, format='TIFF')
+                        
+                        # Save corresponding CLIPPED+CROPPED synthetic
+                        synth_ssim_path = inspection_dir / f"{img_stem}_synthetic_k{best_ssim_k:02d}_bestSSIM_{mode}.tif"
+                        Image.fromarray(synth_for_ssim, mode='F').save(synth_ssim_path, format='TIFF')
+                        
+                        print(f"  ✅ Saved best SSIM pair (k={best_ssim_k}, mode={mode}):")
+                        print(f"     Real: {real_ssim_path.name} (shape: {real_norm_ssim.shape})")
+                        print(f"     Synth: {synth_ssim_path.name} (shape: {synth_for_ssim.shape})")
+                    except Exception as e:
+                        print(f"  ⚠️ Warning: Could not save SSIM images: {e}")
+                        import traceback
+                        traceback.print_exc()
+                
+                # Best RMSE k (ALWAYS save, even if same as SSIM)
+                best_rmse_k = result_dict[mode].get('best_rmse_k')
+                if best_rmse_k is not None:  # ← Removed "and best_rmse_k != best_ssim_k"
+                    try:
+                        raw_img, _ = load_pds_image_data(Path(img_info['pds_path']))
+                        filtered_img, _, _ = filter_hot_pixels(raw_img)
+                        real_norm_rmse = normalize_image(filtered_img, low_p=float(best_rmse_k), high_p=100.0)
+                        
+                        # Clip to PDS dimensions
+                        if 'pds_path' in img_info:
+                            pds_params = extract_pds_clip_params(Path(img_info['pds_path']))
+                            real_norm_rmse = real_norm_rmse[
+                                pds_params['row_off']:pds_params['row_off']+pds_params['height'],
+                                pds_params['col_off']:pds_params['col_off']+pds_params['width']
+                            ]
+                        
+                        # Apply CROPPING if in cropped mode
+                        if mode == "cropped":
+                            real_norm_rmse, synth_for_rmse = crop_to_valid_region(
+                                real_norm_rmse, synth_clipped, valid_mask
+                            )
+                        else:
+                            synth_for_rmse = synth_clipped
+                        
+                        # Save CLIPPED+CROPPED real
+                        real_rmse_path = inspection_dir / f"{img_stem}_real_norm_k{best_rmse_k:02d}_bestRMSE_{mode}.tif"
+                        Image.fromarray(real_norm_rmse, mode='F').save(real_rmse_path, format='TIFF')
+                        
+                        # Save corresponding CLIPPED+CROPPED synthetic
+                        synth_rmse_path = inspection_dir / f"{img_stem}_synthetic_k{best_rmse_k:02d}_bestRMSE_{mode}.tif"
+                        Image.fromarray(synth_for_rmse, mode='F').save(synth_rmse_path, format='TIFF')
+                        
+                        print(f"  ✅ Saved best RMSE pair (k={best_rmse_k}, mode={mode}):")
+                        print(f"     Real: {real_rmse_path.name} (shape: {real_norm_rmse.shape})")
+                        print(f"     Synth: {synth_rmse_path.name} (shape: {synth_for_rmse.shape})")
+                    except Exception as e:
+                        print(f"  ⚠️ Warning: Could not save RMSE images: {e}")
+                        import traceback
+                        traceback.print_exc()
+                
+                # Copy synthetic clipped
+                try:
+                    synth_copy_path = inspection_dir / f"{img_stem}_synthetic_clipped.tif"
+                    shutil.copy(synthetic_file, synth_copy_path)
+                    print(f"  ✅ Saved synthetic clipped: {synth_copy_path.name}")
+                except Exception as e:
+                    print(f"  ⚠️ Warning: Could not copy synthetic: {e}")
+                
+                # Save metadata
+                try:
+                    metadata = {
+                        'particle_id': particle_id,
+                        'img_filename': img_info['filename'],
+                        'best_ssim_k': int(best_ssim_k) if best_ssim_k is not None else None,
+                        'best_ssim_score': float(result_dict[mode].get('best_ssim', np.nan)),
+                        'best_rmse_k': int(best_rmse_k) if best_rmse_k is not None else None,
+                        'best_rmse_score': float(result_dict[mode].get('best_rmse', np.nan)),
+                        'mode': mode,
+                        'objective_type': objective_type,
+                        'final_objective': final_obj
+                    }
+                    
+                    metadata_path = inspection_dir / f"{img_stem}_metadata.json"
+                    with open(metadata_path, 'w') as f:
+                        json.dump(metadata, f, indent=2)
+                    
+                    print(f"  ✅ Saved metadata: {metadata_path.name}")
+                except Exception as e:
+                    print(f"  ⚠️ Warning: Could not save metadata: {e}")
+            
+            print(f"\n✅ Best k inspection images saved to: {inspection_dir}")
+            
+        except Exception as e:
+            print(f"⚠️ Warning: Could not save best k images: {e}")
+            import traceback
+            traceback.print_exc()
+        # ===========================================================
         
         return final_obj
         
