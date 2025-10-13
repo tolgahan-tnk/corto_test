@@ -20,7 +20,7 @@ sys.path.append(os.getcwd())
 import cortopy as corto
 
 # Add post_project to path
-post_project_path = Path(__file__).parent.parent
+post_project_path = Path(__file__).parent.parent.parent
 sys.path.append(str(post_project_path))
 
 from phobos_scene import (
@@ -69,6 +69,20 @@ class SPICEDataCache:
 # CORTO RENDERER CLASS
 # ============================================================================
 
+# ---- Modül-yerel tekil renderer (tüm parçacıklar boyunca reuse) ----
+_GLOBAL_RENDERER = None
+
+def get_renderer(persistent: bool = True, batch_size: Optional[int] = None):
+    global _GLOBAL_RENDERER
+    if _GLOBAL_RENDERER is None:
+        _GLOBAL_RENDERER = CORTORenderer(persistent=persistent, batch_size=batch_size)
+    else:
+        # batch_size değişmişse güncelle
+        _GLOBAL_RENDERER.batch_size = batch_size
+        _GLOBAL_RENDERER.persistent = persistent
+    return _GLOBAL_RENDERER
+
+
 class CORTORenderer:
     """
     Wrapper for CORTO rendering with photometric parameters.
@@ -78,7 +92,9 @@ class CORTORenderer:
                  scenario_name: str = "S07_Mars_Phobos_Deimos",
                  body_files: List[str] = None,
                  temp_dir: Optional[Path] = None,
-                 cleanup: bool = True):
+                 cleanup: bool = True,
+                 persistent: bool = True,
+                 batch_size: Optional[int] = None):
         """
         Initialize CORTO renderer.
         
@@ -89,38 +105,76 @@ class CORTORenderer:
             cleanup: Whether to clean up temp files after rendering
         """
         self.scenario_name = scenario_name
-        
-        if body_files is None:
-            self.body_files = [
-                "g_phobos_036m_spc_0000n00000_v002.obj",
-                "Mars_65k.obj",
-                "g_deimos_162m_spc_0000n00000_v001.obj",
-            ]
-        else:
-            self.body_files = body_files
-        
-        # Temp directory
-        if temp_dir is None:
-            self.temp_dir = Path(tempfile.mkdtemp(prefix="corto_opt_"))
-        else:
-            self.temp_dir = Path(temp_dir)
-            self.temp_dir.mkdir(parents=True, exist_ok=True)
-        
+        self.body_files = body_files or [
+            "g_phobos_036m_spc_0000n00000_v002.obj",
+            "Mars_65k.obj",
+            "g_deimos_162m_spc_0000n00000_v001.obj",
+        ]
+        self.temp_dir = Path(temp_dir) if temp_dir else Path(tempfile.mkdtemp(prefix="corto_opt_"))
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.cleanup = cleanup
-        
-        # SPICE cache
+        self.persistent = persistent
+        self.batch_size = batch_size
+
+        # Kalıcı sahne önbelleği
+        self._built = False
+        self._renders_since_build = 0
+        self._cache = {
+            'ENV': None, 'cam': None, 'sun': None,
+            'bodies': None, 'mat_nodes': None, 'tree': None
+        }
+
+        # SPICE cache & camera
         self.spice_cache = SPICEDataCache()
-        
-        # Camera config (load once)
         self.camera_config = get_camera_config()
-        
-        # Sun scaler (from phobos_main.py)
         self.sun_blender_scaler = 3.90232e-1
-        
+
+        # PERSIST ve BATCH kontrolü
+        self.persistent = persistent
+        self.batch_size = batch_size
+        self._prepared = False
+        self._batch_count = 0
+        self._ENV = None; self._cam = None; self._sun = None
+        self._mat_nodes = None; self._State = None
+
         print(f"CORTO Renderer initialized")
         print(f"  Scenario: {scenario_name}")
         print(f"  Temp dir: {self.temp_dir}")
         print(f"  Cleanup: {cleanup}")
+        print(f"  Persistent: {self.persistent}, Batch size: {self.batch_size}")
+
+    def _build_or_reuse_scene(self, spice_data: Dict):
+        """Sahneyi ilk kez kur veya batch sınırı geldiyse yeniden kur; aksi halde sadece güncelle."""
+        need_rebuild = (not self._prepared) or (self.batch_size and self._batch_count >= self.batch_size) or (not self.persistent)
+
+        # Güneş enerjisi (base)
+        solar_distance_km = float(spice_data['distances']['sun_to_phobos'])
+        base_energy = calculate_sun_strength(solar_distance_km, q_eff=1.0, sun_blender_scaler=self.sun_blender_scaler)
+
+        if need_rebuild:
+            # Sahneyi temizle ve GPU'yu seç
+            corto.Utils.clean_scene()
+            force_nvidia_gpu()
+
+            # Dinamik JSON'ları tek isimle overwrite et
+            scene_filename, geom_filename = write_dynamic_scene_files(
+                self.temp_dir, spice_data, self.camera_config, base_energy, idx=0
+            )
+
+            # State ve sahne kurulumu
+            self._State = corto.State(scene=scene_filename, geometry=geom_filename, body=self.body_files, scenario=self.scenario_name)
+            add_asset_paths(self._State)
+            self._ENV, self._cam, self._sun, _bodies, self._mat_nodes, _tree = build_scene_and_materials(self._State, self.body_files)
+
+            self._prepared = True
+            self._batch_count = 0
+        else:
+            # Sahneyi koru, sadece JSON'ları güncelle (transformlar PositionAll ile yenilenecek)
+            write_dynamic_scene_files(self.temp_dir, spice_data, self.camera_config, base_energy, idx=0)
+
+        # Transformları güncelle
+        self._ENV.PositionAll(self._State, index=0)
+
     
     def render_for_image(self,
                          img_info: Dict,
@@ -141,91 +195,41 @@ class CORTORenderer:
             True if successful, False otherwise
         """
         try:
-            # Clean scene
-            corto.Utils.clean_scene()
-            force_nvidia_gpu()
-            
-            # Get SPICE data
             spice_data = self.spice_cache.get_spice_data(img_info['utc_time'])
-            
-            # Calculate sun energy
-            solar_distance_km = spice_data['distances']['sun_to_phobos']
-            base_energy = calculate_sun_strength(
-                solar_distance_km,
-                q_eff=1.0,
-                sun_blender_scaler=self.sun_blender_scaler
-            )
-            
-            # Create dynamic scene files
-            scene_filename, geom_filename = write_dynamic_scene_files(
-                self.temp_dir,
-                spice_data,
-                self.camera_config,
-                base_energy,
-                0  # Single frame
-            )
-            
-            # Create CORTO State
-            state = corto.State(
-                scene=scene_filename,
-                geometry=geom_filename,
-                body=self.body_files,
-                scenario=self.scenario_name
-            )
-            
-            # Add asset paths
-            add_asset_paths(state)
-            
-            # Build scene and materials
-            ENV, cam, sun, bodies, mat_nodes, tree = build_scene_and_materials(
-                state, self.body_files
-            )
-            
-            # **APPLY PHOTOMETRIC PARAMETERS**
+            self._build_or_reuse_scene(spice_data)
+
+            # Parametreleri uygula (yalnızca node değerleri güncellenir)
             params_dict = self._params_to_dict(params)
-            set_phobos_params(mat_nodes, params_dict)
-            
-            # Calculate sun energy with q_eff from parameters
+            set_phobos_params(self._mat_nodes, params_dict)
+
+            # q_eff'e göre güneş enerjisi
+            solar_distance_km = float(spice_data['distances']['sun_to_phobos'])
             q_eff = float(params_dict['q_eff'])
-            sun_energy = calculate_sun_strength(
-                solar_distance_km,
-                q_eff=q_eff,
-                sun_blender_scaler=self.sun_blender_scaler
-            )
-            sun.set_energy(sun_energy)
-            
-            # Position objects
-            ENV.PositionAll(state, index=0)
-            
-            # Select camera
-            corto.Camera.select_camera(cam.name)
-            
-            # Set output path
+            sun_energy = calculate_sun_strength(solar_distance_km, q_eff=q_eff, sun_blender_scaler=self.sun_blender_scaler)
+            self._sun.set_energy(sun_energy)
+
+            # Kamera ve render ayarları
+            corto.Camera.select_camera(self._cam.name)
             bpy.context.scene.render.filepath = str(output_path.with_suffix(''))
-            
-            # Configure for 16-bit PNG
             bpy.context.scene.render.image_settings.file_format = 'PNG'
             bpy.context.scene.render.image_settings.color_depth = '16'
             bpy.context.scene.render.image_settings.compression = 0
             bpy.context.scene.view_settings.view_transform = 'Raw'
-            
-            # Render
+
             bpy.ops.render.render(write_still=True)
-            
-            # Blender adds .png extension
+            self._batch_count += 1
+
             rendered_file = output_path.with_suffix('.png')
-            
             if not rendered_file.exists():
                 print(f"Error: Rendered file not found: {rendered_file}")
                 return False
-            
+
             print(f"✓ Rendered: {rendered_file.name}")
             return True
-            
+
         except Exception as e:
             print(f"Error rendering for {img_info['filename']}: {e}")
-            import traceback
-            traceback.print_exc()
+            import traceback; traceback.print_exc()
             return False
     
     def _params_to_dict(self, params: np.ndarray) -> Dict[str, float]:
@@ -256,7 +260,9 @@ def render_synthetic_for_params(
     img_info_list: List[Dict],
     params: np.ndarray,
     output_dir: Path,
-    particle_id: int
+    particle_id: int,
+    persistent: bool = True,
+    batch_size: Optional[int] = None
 ) -> List[Path]:
     """
     Render synthetic images for multiple real IMG files with given parameters.
@@ -273,7 +279,7 @@ def render_synthetic_for_params(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    renderer = CORTORenderer()
+    renderer = get_renderer(persistent=persistent, batch_size=batch_size)
     rendered_files = []
     
     for i, img_info in enumerate(img_info_list):

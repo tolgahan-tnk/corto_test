@@ -392,11 +392,35 @@ def quick_evaluate(img_filename: str,
         raise RuntimeError(f"Failed to load synthetic image: {e}") from e
     
     # Check shape compatibility
-    if filtered_img.shape != synth_img.shape:
-        raise ValueError(
-            f"Shape mismatch: IMG {filtered_img.shape} vs Synthetic {synth_img.shape}"
-        )
-    
+    # ========== STEP 3.5: ALWAYS CLIP BOTH IMAGES TO PDS WINDOW ==========
+    if verbose:
+        print("\nStep 3.5: Clipping to PDS window for BOTH real and synthetic...")
+
+    try:
+        pds_params = extract_pds_clip_params(img_path)
+        col_off = pds_params['col_off']; row_off = pds_params['row_off']
+        width   = pds_params['width'];   height  = pds_params['height']
+
+        # clip real (filtered_img) to PDS window
+        filtered_img = filtered_img[row_off:row_off+height, col_off:col_off+width]
+
+        # clip synthetic to same window
+        synth_img = clip_synthetic_to_pds(synth_img, pds_params)
+
+        if verbose:
+            print(f"  PDS Clip: off=({row_off},{col_off}), size=({height},{width})")
+            print(f"  Real   -> {filtered_img.shape}")
+            print(f"  Synth  -> {synth_img.shape}")
+
+        # Son doğrulama
+        if filtered_img.shape != synth_img.shape:
+            raise ValueError(
+                f"Post-clip shape mismatch: IMG {filtered_img.shape} vs Synthetic {synth_img.shape}"
+            )
+
+    except Exception as e:
+        raise RuntimeError(f"Failed to clip to PDS window: {e}") from e
+
     # ========== STEP 4: K-Sweep Evaluation ==========
     k_min, k_max = get_k_range(img_stem)
     

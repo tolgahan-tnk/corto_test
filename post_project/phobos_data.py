@@ -3,12 +3,12 @@
 phobos_data.py
 Phobos Photometric Template Generator - Data Management Module
 
-Tasks
-- PDS processing
-- SPICE implementation 
-- Parameter griding
-- Solar Flux calculations
-- Helper funcions
+Sorumluluklar:
+- PDS veri işleme
+- SPICE entegrasyonu
+- Parametre grid oluşturma
+- Güneş enerjisi hesaplamaları
+- Yardımcı fonksiyonlar
 """
 
 import os

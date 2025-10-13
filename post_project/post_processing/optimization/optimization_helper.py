@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Callable
+from typing import Dict, List, Tuple, Optional, Callable, Union
 import json
 import matplotlib.pyplot as plt
 import sys
@@ -23,11 +23,21 @@ import os
 sys.path.append(str(Path(__file__).parent.parent))
 
 # Import evaluation function from quick_evaluator
-from quick_evaluator import quick_evaluate
+
 
 # Forward declaration for corto_renderer (to avoid circular import)
 render_synthetic_for_params = None
+# ============================================================================
+# LIGHTWEIGHT METRIC STASH (for per-eval logging)
+# ============================================================================
+_LAST_EVAL_METRICS = {"nmrse": float("nan"), "ssim": float("nan")}
 
+def set_last_eval_metrics(nmrse: float, ssim: float):
+    _LAST_EVAL_METRICS["nmrse"] = float(nmrse)
+    _LAST_EVAL_METRICS["ssim"] = float(ssim)
+
+def get_last_eval_metrics():
+    return dict(_LAST_EVAL_METRICS)
 
 # ============================================================================
 # PARAMETER DEFINITIONS
@@ -108,16 +118,20 @@ def print_params_table(params: np.ndarray):
 # OBJECTIVE FUNCTION WITH RENDERING
 # ============================================================================
 
-def evaluate_params_with_rendering(
-    params: np.ndarray,
-    img_info_list: List[Dict],
-    objective_type: str = 'ssim',
-    mode: str = 'cropped',
-    aggregation: str = 'mean',
-    particle_id: int = 0,
-    temp_dir: Optional[Path] = None,
-    verbose: bool = False
-) -> float:
+def evaluate_params_with_rendering(params,
+                                   img_info_list,
+                                   objective_type,
+                                   mode,
+                                   aggregation,
+                                   particle_id,
+                                   temp_dir,
+                                   verbose=False,
+                                   # YENİ: k araması için opsiyonlar
+                                   k_mode: str = 'learned',
+                                   learned_k_db: Optional[Dict[str, int]] = None,
+                                   # YENİ: Blender kalıcılık/batch
+                                   blender_persistent: bool = True,
+                                   blender_batch_size: Optional[int] = None):
     """
     Evaluate parameters by:
     1. Rendering synthetic images with CORTO
@@ -145,7 +159,7 @@ def evaluate_params_with_rendering(
     import json
     from pathlib import Path
     from pds_processor import load_pds_image_data, filter_hot_pixels
-    from metrics_evaluator import normalize_image
+    from metrics_evaluator import normalize_image, compute_metrics, evaluate_k
     from quick_evaluator import extract_pds_clip_params
     # ==========================================
     
@@ -178,7 +192,10 @@ def evaluate_params_with_rendering(
             img_info_list=img_info_list,
             params=params_clipped,
             output_dir=particle_temp_dir,
-            particle_id=particle_id
+            particle_id=particle_id,
+            # YENİ: kalıcılık/batch parametreleri aşağıya iletiliyor
+            persistent=blender_persistent,
+            batch_size=blender_batch_size
         )
         
         if None in synthetic_files:
@@ -243,30 +260,41 @@ def evaluate_params_with_rendering(
                 print(f"  Real: {img_info['filename']}")
                 print(f"  Synthetic: {synthetic_file.name}")
             
-            results = quick_evaluate(
-                img_filename=img_info['filename'],
-                synthetic_filename=str(synthetic_file),
-                mode=mode,
-                verbose=verbose
+            # --- YENİ: metrics_evaluator.evaluate_k kullan ---
+            # Real (filtered) ve synthetic (float32 [0,1]) burada dosyadan okunarak
+            # evaluate_k içinde normalize/align/crop yapılır.
+            # Not: quick_evaluate yerine in-RAM learned_k_db ile hızlanır.
+            # Real görüntüyü oku ve hot-pixel filtresi uygula
+            raw_img, _ = load_pds_image_data(Path(img_info['pds_path']))
+            filtered_img, _, _ = filter_hot_pixels(raw_img)
+            # Synthetic'i float32 olarak yükle (zaten [0,1] kaydedildi)
+            synth_img = np.array(Image.open(synthetic_file), dtype=np.float32)
+            synth_img = np.clip(synth_img, 0.0, 1.0)
+
+            img_stem = Path(img_info['filename']).stem
+            eval_res = evaluate_k(
+                real_raw=filtered_img,
+                synthetic_norm=synth_img,
+                img_stem=img_stem,
+                mode=mode,                      # "cropped" | "uncropped"
+                buffer_percent=5.0,
+                verbose=verbose,
+                k_mode=k_mode,
+                learned_k_db=learned_k_db
             )
-            
-            results_list.append(results)  # Save for inspection
-            
-            if mode not in results:
-                objectives.append(np.inf)
-                continue
-            
+            results_list.append(eval_res)  # Save for inspection
+
             # Calculate objective
             if objective_type == 'ssim':
-                obj_val = -results[mode]['best_ssim']  # Negative because we minimize
+                obj_val = -float(eval_res['best_ssim_score'])  # minimize
             elif objective_type == 'rmse':
-                obj_val = results[mode]['best_rmse']
+                obj_val = float(eval_res['best_rmse_score'])
             elif objective_type == 'nmrse':
-                obj_val = results[mode]['best_rmse'] / 1.0
+                obj_val = float(eval_res['best_rmse_score']) / 1.0
             elif objective_type == 'combined':
-                ssim = results[mode]['best_ssim']
-                rmse = results[mode]['best_rmse']
-                obj_val = (1.0 - ssim) + rmse
+                ssim_best = float(eval_res['best_ssim_score'])
+                rmse_best = float(eval_res['best_rmse_score'])
+                obj_val = (1.0 - ssim_best) + rmse_best
             else:
                 raise ValueError(f"Unknown objective: {objective_type}")
             
@@ -289,32 +317,60 @@ def evaluate_params_with_rendering(
         
         if verbose:
             print(f"\nFinal Objective: {final_obj:.6f}\n")
+        # ---- Aggregate metrics for logging wrapper (stash globally) ----
+        try:
+            # results_list elemanları evaluate_k çıktısı
+            ssim_vals = [float(r.get('best_ssim_score', np.nan)) for r in results_list]
+            rmse_vals = [float(r.get('best_rmse_score', np.nan)) for r in results_list]
+
+            # SSIM ve NMRSE (RMSE, veri aralığı [0,1] olduğundan 1.0'a bölmek yeterli)
+            ssim_mean  = float(np.nanmean(np.array(ssim_vals))) if len(ssim_vals) else float('nan')
+            nmrse_mean = float(np.nanmean(np.array(rmse_vals))) if len(rmse_vals) else float('nan')
+
+            set_last_eval_metrics(nmrse=nmrse_mean, ssim=ssim_mean)
+        except Exception:
+            # Logging hiçbir zaman objective akışını bozmasın
+            pass        
+        
         
         # ============ SAVE BEST K IMAGES FOR INSPECTION ============
         try:
-            # Create inspection directory
-            from metrics_evaluator import detect_masked_regions, crop_to_valid_region
-
+            from metrics_evaluator import align_and_crop_with_buffer
+            
             # Create inspection directory
             inspection_dir = particle_temp_dir / "best_k_inspection"
             inspection_dir.mkdir(parents=True, exist_ok=True)
-
+            
             # For each IMG, save best k images
             for i, (img_info, synthetic_file, result_dict) in enumerate(zip(img_info_list, synthetic_files, results_list)):
-                if mode not in result_dict:
-                    continue
+                # result_dict artık evaluate_k çıktısı
                 
                 img_stem = Path(img_info['filename']).stem
                 
-                # Load synthetic clipped (already normalized [0,1])
-                synth_clipped = np.array(Image.open(synthetic_file), dtype=np.float32)
+                # ===== RELOAD SYNTHETIC AND CLIP TO PDS DIMENSIONS =====
+                try:
+                    # Load synthetic (already normalized [0,1])
+                    synth_raw = np.array(Image.open(synthetic_file), dtype=np.float32)
+                    synth_raw = np.clip(synth_raw, 0.0, 1.0)
+                    
+                    # Clip to PDS dimensions
+                    if 'pds_path' in img_info:
+                        pds_params = extract_pds_clip_params(Path(img_info['pds_path']))
+                        synth_clipped = synth_raw[
+                            pds_params['row_off']:pds_params['row_off']+pds_params['height'],
+                            pds_params['col_off']:pds_params['col_off']+pds_params['width']
+                        ]
+                    else:
+                        synth_clipped = synth_raw
+                    
+                    print(f"  Synthetic clipped shape: {synth_clipped.shape}")
+                    
+                except Exception as e:
+                    print(f"  ⚠️ Warning: Could not reload synthetic: {e}")
+                    continue
                 
-                # Detect masked regions and get valid mask (for cropped mode)
-                if mode == "cropped":
-                    valid_mask = detect_masked_regions(synth_clipped, buffer_percent=5.0)
-                
-                # Best SSIM k
-                best_ssim_k = result_dict[mode].get('best_ssim_k')
+                # ===== BEST SSIM K =====
+                best_ssim_k = result_dict.get('best_ssim_k')
                 if best_ssim_k is not None:
                     try:
                         # Load and normalize real at best SSIM k
@@ -324,96 +380,155 @@ def evaluate_params_with_rendering(
                         
                         # Clip to PDS dimensions
                         if 'pds_path' in img_info:
-                            pds_params = extract_pds_clip_params(Path(img_info['pds_path']))
                             real_norm_ssim = real_norm_ssim[
                                 pds_params['row_off']:pds_params['row_off']+pds_params['height'],
                                 pds_params['col_off']:pds_params['col_off']+pds_params['width']
                             ]
                         
-                        # Apply CROPPING if in cropped mode
+                        print(f"  Real (k={best_ssim_k}) clipped shape: {real_norm_ssim.shape}")
+                        
+                        # Check shape compatibility
+                        if real_norm_ssim.shape != synth_clipped.shape:
+                            print(f"  ⚠️ Shape mismatch: real {real_norm_ssim.shape} vs synth {synth_clipped.shape}")
+                            continue
+                        
+                        # Apply ALIGNMENT & CROPPING if in cropped mode
                         if mode == "cropped":
-                            real_norm_ssim, synth_for_ssim = crop_to_valid_region(
-                                real_norm_ssim, synth_clipped, valid_mask
+                            alignment_result = align_and_crop_with_buffer(
+                                imgA=real_norm_ssim,
+                                imgB=synth_clipped,
+                                buffer_ratio=0.05,            # ← A patch’i ile artık geçerli
+                                upsample_factor=100,
+                                interpolation_order=1
                             )
+                            real_norm_ssim = alignment_result['A_crop']
+                            synth_for_ssim = alignment_result['B_crop']
+                            
+                            # Save alignment info
+                            alignment_info = {
+                                'k': int(best_ssim_k),
+                                'metric': 'SSIM',
+                                'shift_dy': float(alignment_result['shift'][0]),
+                                'shift_dx': float(alignment_result['shift'][1]),
+                                'bbox': [int(x) for x in alignment_result['bbox']],
+                                'cropped_shape': list(real_norm_ssim.shape)
+                            }
+                            
+                            alignment_path = inspection_dir / f"{img_stem}_alignment_k{best_ssim_k:02d}_bestSSIM.json"
+                            with open(alignment_path, 'w') as f:
+                                json.dump(alignment_info, f, indent=2)
+                            
+                            print(f"  ✅ Saved alignment info: {alignment_path.name}")
                         else:
                             synth_for_ssim = synth_clipped
                         
-                        # Save CLIPPED+CROPPED real
+                        # Save CLIPPED+(ALIGNED+CROPPED) real
                         real_ssim_path = inspection_dir / f"{img_stem}_real_norm_k{best_ssim_k:02d}_bestSSIM_{mode}.tif"
                         Image.fromarray(real_norm_ssim, mode='F').save(real_ssim_path, format='TIFF')
                         
-                        # Save corresponding CLIPPED+CROPPED synthetic
+                        # Save corresponding synthetic
                         synth_ssim_path = inspection_dir / f"{img_stem}_synthetic_k{best_ssim_k:02d}_bestSSIM_{mode}.tif"
                         Image.fromarray(synth_for_ssim, mode='F').save(synth_ssim_path, format='TIFF')
                         
                         print(f"  ✅ Saved best SSIM pair (k={best_ssim_k}, mode={mode}):")
                         print(f"     Real: {real_ssim_path.name} (shape: {real_norm_ssim.shape})")
                         print(f"     Synth: {synth_ssim_path.name} (shape: {synth_for_ssim.shape})")
+                        if mode == "cropped":
+                            print(f"     Shift: dy={alignment_info['shift_dy']:.2f}, dx={alignment_info['shift_dx']:.2f}")
+                            
                     except Exception as e:
                         print(f"  ⚠️ Warning: Could not save SSIM images: {e}")
                         import traceback
                         traceback.print_exc()
                 
-                # Best RMSE k (ALWAYS save, even if same as SSIM)
-                best_rmse_k = result_dict[mode].get('best_rmse_k')
-                if best_rmse_k is not None:  # ← Removed "and best_rmse_k != best_ssim_k"
+                # ===== BEST RMSE K =====
+                best_rmse_k = result_dict.get('best_rmse_k')
+                if best_rmse_k is not None and best_rmse_k != best_ssim_k:
                     try:
+                        # Load and normalize real at best RMSE k
                         raw_img, _ = load_pds_image_data(Path(img_info['pds_path']))
                         filtered_img, _, _ = filter_hot_pixels(raw_img)
                         real_norm_rmse = normalize_image(filtered_img, low_p=float(best_rmse_k), high_p=100.0)
                         
                         # Clip to PDS dimensions
                         if 'pds_path' in img_info:
-                            pds_params = extract_pds_clip_params(Path(img_info['pds_path']))
                             real_norm_rmse = real_norm_rmse[
                                 pds_params['row_off']:pds_params['row_off']+pds_params['height'],
                                 pds_params['col_off']:pds_params['col_off']+pds_params['width']
                             ]
                         
-                        # Apply CROPPING if in cropped mode
+                        print(f"  Real (k={best_rmse_k}) clipped shape: {real_norm_rmse.shape}")
+                        
+                        # Check shape compatibility
+                        if real_norm_rmse.shape != synth_clipped.shape:
+                            print(f"  ⚠️ Shape mismatch: real {real_norm_rmse.shape} vs synth {synth_clipped.shape}")
+                            continue
+                        
+                        # Apply ALIGNMENT & CROPPING if in cropped mode
                         if mode == "cropped":
-                            real_norm_rmse, synth_for_rmse = crop_to_valid_region(
-                                real_norm_rmse, synth_clipped, valid_mask
+                            alignment_result = align_and_crop_with_buffer(
+                                imgA=real_norm_rmse,              # ← DOĞRU: RMSE normalizasyonu
+                                imgB=synth_clipped,
+                                buffer_pixels=50,
+                                upsample_factor=100,
+                                interpolation_order=1
                             )
+                            real_norm_rmse = alignment_result['A_crop']   # ← DOĞRU: RMSE değişkenine yaz
+                            synth_for_rmse = alignment_result['B_crop']   # ← DOĞRU: RMSE sentetiği
+                            # Save alignment info
+                            alignment_info = {
+                                'k': int(best_rmse_k),
+                                'metric': 'RMSE',
+                                'shift_dy': float(alignment_result['shift'][0]),
+                                'shift_dx': float(alignment_result['shift'][1]),
+                                'bbox': [int(x) for x in alignment_result['bbox']],
+                                'cropped_shape': list(real_norm_rmse.shape)  # ← DOĞRU şekil
+                            }
+                            alignment_path = inspection_dir / f"{img_stem}_alignment_k{best_rmse_k:02d}_bestRMSE.json"
+                            with open(alignment_path, 'w') as f:
+                                json.dump(alignment_info, f, indent=2)
                         else:
                             synth_for_rmse = synth_clipped
-                        
-                        # Save CLIPPED+CROPPED real
+
+                        # Save CLIPPED+(ALIGNED+CROPPED) real
                         real_rmse_path = inspection_dir / f"{img_stem}_real_norm_k{best_rmse_k:02d}_bestRMSE_{mode}.tif"
                         Image.fromarray(real_norm_rmse, mode='F').save(real_rmse_path, format='TIFF')
-                        
-                        # Save corresponding CLIPPED+CROPPED synthetic
+
+                        # Save corresponding synthetic
                         synth_rmse_path = inspection_dir / f"{img_stem}_synthetic_k{best_rmse_k:02d}_bestRMSE_{mode}.tif"
                         Image.fromarray(synth_for_rmse, mode='F').save(synth_rmse_path, format='TIFF')
                         
                         print(f"  ✅ Saved best RMSE pair (k={best_rmse_k}, mode={mode}):")
                         print(f"     Real: {real_rmse_path.name} (shape: {real_norm_rmse.shape})")
                         print(f"     Synth: {synth_rmse_path.name} (shape: {synth_for_rmse.shape})")
+                        if mode == "cropped":
+                            print(f"     Shift: dy={alignment_info['shift_dy']:.2f}, dx={alignment_info['shift_dx']:.2f}")
+                            
                     except Exception as e:
                         print(f"  ⚠️ Warning: Could not save RMSE images: {e}")
                         import traceback
                         traceback.print_exc()
                 
-                # Copy synthetic clipped
+                # ===== COPY SYNTHETIC CLIPPED (FOR REFERENCE) =====
                 try:
                     synth_copy_path = inspection_dir / f"{img_stem}_synthetic_clipped.tif"
-                    shutil.copy(synthetic_file, synth_copy_path)
+                    Image.fromarray(synth_clipped, mode='F').save(synth_copy_path, format='TIFF')
                     print(f"  ✅ Saved synthetic clipped: {synth_copy_path.name}")
                 except Exception as e:
                     print(f"  ⚠️ Warning: Could not copy synthetic: {e}")
                 
-                # Save metadata
+                # ===== SAVE METADATA =====
                 try:
                     metadata = {
                         'particle_id': particle_id,
                         'img_filename': img_info['filename'],
                         'best_ssim_k': int(best_ssim_k) if best_ssim_k is not None else None,
-                        'best_ssim_score': float(result_dict[mode].get('best_ssim', np.nan)),
+                        'best_ssim_score': float(result_dict.get('best_ssim_score', np.nan)),
                         'best_rmse_k': int(best_rmse_k) if best_rmse_k is not None else None,
-                        'best_rmse_score': float(result_dict[mode].get('best_rmse', np.nan)),
+                        'best_rmse_score': float(result_dict.get('best_rmse_score', np.nan)),
                         'mode': mode,
                         'objective_type': objective_type,
-                        'final_objective': final_obj
+                        'final_objective': float(final_obj)
                     }
                     
                     metadata_path = inspection_dir / f"{img_stem}_metadata.json"
@@ -439,7 +554,56 @@ def evaluate_params_with_rendering(
         import traceback
         traceback.print_exc()
         return np.inf
+# ============================================================================
+# OBJECTIVE WRAPPER: ITER/PARTICLE LOG + OPTIONAL CSV
+# ============================================================================
+def with_eval_logging(objective_fn: Callable,
+                      pop_size: int,
+                      csv_dir: Optional[Union[Path, str]] = None):
+    """
+    objective_fn: mevcut objective (params -> float)
+    pop_size    : her iterasyondaki parçacık sayısı (swarm/population)
+    csv_dir     : CSV yazılacak klasör (None ise sadece konsol)
 
+    Kullanım:
+        obj_wrapped = with_eval_logging(objective, pop_size, csv_dir="optimization_temp")
+        result = optimizer.minimize(obj_wrapped, ...)
+    """
+    eval_idx = 0
+    csv_f = None
+    if csv_dir:
+        csv_dir = Path(csv_dir)
+        csv_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = csv_dir / f"eval_history_{stamp}.csv"
+        csv_f = open(csv_path, "w", buffering=1)
+        print("iteration,particle,objective,nmrse,ssim", file=csv_f)
+
+    def wrapped(x):
+        nonlocal eval_idx, csv_f
+        ps = max(1, int(pop_size))
+        it  = eval_idx // ps
+        pid = eval_idx %  ps
+
+        if pid == 0:
+            print(f"\n=== Iteration {it} ===")
+
+        val = objective_fn(x)
+
+        try:
+            m = get_last_eval_metrics()
+            nmrse = float(m.get("nmrse", float("nan")))
+            ssim  = float(m.get("ssim",  float("nan")))
+        except Exception:
+            nmrse, ssim = float("nan"), float("nan")
+
+        print(f"[it {it:03d} | p{pid:03d}] obj={val:+.6f}  NMRSE={nmrse:.6f}  SSIM={ssim:.6f}")
+        if csv_f:
+            print(f"{it},{pid},{val},{nmrse},{ssim}", file=csv_f)
+        eval_idx += 1
+        return val
+
+    return wrapped
 
 # ============================================================================
 # OPTIMIZATION LOGGER

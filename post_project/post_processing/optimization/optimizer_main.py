@@ -35,7 +35,7 @@ from PSO import run_pso
 from Genetic import run_genetic
 
 # Add parent directory to path for phobos_data imports
-sys.path.append(str(Path(__file__).parent.parent))
+sys.path.append(str(Path(__file__).parent.parent.parent))
 from phobos_data import CompactPDSProcessor, HAS_SPICE, SpiceDataProcessor
 
 
@@ -231,6 +231,8 @@ def create_objective_function(config: Dict, img_info_list: List[Dict]):
     """Create objective function from configuration."""
     
     particle_counter = {'count': 0}
+    # Run boyunca k değerlerini cache'lemek için bellek içi DB
+    learned_k_db: Dict[str, int] = {}
     
     def objective_function(params):
         particle_id = particle_counter['count']
@@ -244,7 +246,12 @@ def create_objective_function(config: Dict, img_info_list: List[Dict]):
             aggregation=config['aggregation'],
             particle_id=particle_id,
             temp_dir=Path(config.get('temp_dir', 'optimization_temp')),
-            verbose=config.get('verbose_eval', False)
+            verbose=config.get('verbose_eval', False),
+            # k araması için yeni opsiyonlar
+            k_mode=config.get('k_mode', 'learned'),
+            learned_k_db=learned_k_db,
+            blender_persistent=config.get('blender_persistent', True),
+            blender_batch_size=config.get('blender_batch_size', None),
         )
     
     return objective_function
@@ -379,6 +386,12 @@ Examples:
         help='Verbose evaluation output'
     )
     
+    # parser = argparse.ArgumentParser(...)
+    parser.add_argument("--blender-batch-size", type=int, default=20,
+                        help="Sahneyi her N renderda bir yeniden kur (persistent cache)")
+    parser.add_argument("--k-mode", choices=["sweep","learned"], default="learned",
+                        help="k araması: 'sweep' ya da 'learned' (tek k, guard+dar bant teyit)")
+
     args = parser.parse_args()
     
     # ========== Load Configuration ==========
@@ -431,7 +444,12 @@ Examples:
     
     if args.seed:
         config[algorithm_key]['seed'] = args.seed
-    
+
+    # --- : CLI'dan gelen k arama modu config'e yaz ---
+    config['k_mode'] = args.k_mode
+    # YENİ: Blender kalıcılık/batch ayarları
+    config['blender_persistent'] = True
+    config['blender_batch_size'] = args.blender_batch_size
     # ========== Scan PDS Directory ==========
     try:
         img_info_list = scan_pds_directory(

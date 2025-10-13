@@ -3,12 +3,12 @@
 phobos_scene.py
 Phobos Photometric Template Generator - Scene Management Module
 
-Tasks:
-- GPU forcing
-- Blender scene mang.
-- Shader and material installation
-- Compositing branchs
-- 16-bit PNG 
+Sorumluluklar:
+- GPU konfigürasyonu
+- Blender sahne oluşturma
+- Malzeme ve shader kurulumu
+- Compositing branch'leri
+- 16-bit PNG kaydetme
 """
 
 import os
@@ -135,6 +135,11 @@ def build_scene_and_materials(State, body_names):
     
     rendering_engine = corto.Rendering(State.properties_rendering)
     ENV = corto.Environment(cam, [body_1, body_2, body_3], sun, rendering_engine)
+
+    try:
+        bpy.context.scene.cycles.use_persistent_data = True
+    except Exception:
+        pass
 
     # Advanced Phobos material
     phobos_material = corto.Shading.create_new_material('Phobos_Advanced_Hybrid')

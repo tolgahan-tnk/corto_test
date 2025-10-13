@@ -26,6 +26,8 @@ from PIL import Image
 from typing import Tuple, Optional, Dict, List
 from skimage.metrics import structural_similarity as ssim
 from scipy.ndimage import binary_dilation
+from skimage.registration import phase_cross_correlation
+from skimage.transform import warp, AffineTransform
 
 
 # Suppress warnings
@@ -272,148 +274,240 @@ def compute_metrics(real_01: np.ndarray,
     
     return ssim_score, rmse, hist_corr
 
+def align_and_crop_with_buffer(
+    imgA: np.ndarray,
+    imgB: np.ndarray,
+    buffer_pixels: Optional[int] = None,
+    buffer_percent: Optional[float] = 5.0,
+    mask_threshold: float = 0.02,        # YENİ: içerik eşiği
+    upsample_factor: int = 100,
+    interpolation_order: int = 1,
+    buffer_ratio: Optional[float] = None,
+) -> dict:
+    """
+    Align two images using phase cross-correlation and crop to the *content* overlap.
+    Cropping now uses: valid = isfinite(B_aligned) & (B_aligned > mask_threshold)
+    Buffer can be given in pixels or as percent of max(H, W).
+    Returns A_crop, B_crop, shift, bbox, and used buffer_px.
+    """
+    if imgA.ndim != 2 or imgB.ndim != 2:
+        raise ValueError("Only single-channel (2D) images are supported.")
+
+    A = imgA.astype("float32", copy=False)
+    B = imgB.astype("float32", copy=False)
+    H, W = A.shape
+
+    # --- 1) Sub-pixel shift ---
+    shift, error, diffphase = phase_cross_correlation(A, B, upsample_factor=upsample_factor)
+    dy, dx = float(shift[0]), float(shift[1])
+    print(f"  Phase correlation shift: dy={dy:.2f}, dx={dx:.2f} pixels")
+
+    # --- 2) Warp B to A ---
+    tform = AffineTransform(translation=(dx, dy))
+    B_aligned = warp(
+        B, inverse_map=tform.inverse, output_shape=A.shape,
+        preserve_range=True, mode="constant", cval=np.nan, order=interpolation_order
+    ).astype("float32")
+
+    # --- 3) İçerik maskesi (YENİ) ---
+    finite_mask = np.isfinite(B_aligned)
+    content_mask = finite_mask & (B_aligned > mask_threshold)
+
+    if not np.any(content_mask):
+        # Fallback: sadece finite overlap
+        print("[WARNING] Content mask empty; falling back to finite overlap.")
+        content_mask = finite_mask
+
+    ys, xs = np.where(content_mask)
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    print(f"  Content overlap (before buffer): y=[{y0}:{y1}], x=[{x0}:{x1}]")
+
+    # --- 4) Buffer hesaplama ---
+    if buffer_pixels is None:
+        if buffer_ratio is not None:
+            buffer_px = max(0, int(round(buffer_ratio * max(H, W))))
+        elif buffer_percent is not None:
+            buffer_px = max(0, int(round((buffer_percent / 100.0) * max(H, W))))
+        else:
+            buffer_px = 0
+    else:
+        buffer_px = int(max(0, buffer_pixels))
+
+    # Dışa doğru genişlet, sınırları kırp
+    y0b = max(0, y0 - buffer_px)
+    x0b = max(0, x0 - buffer_px)
+    y1b = min(H, y1 + buffer_px)
+    x1b = min(W, x1 + buffer_px)
+
+    if x1b <= x0b or y1b <= y0b:
+        y0b, y1b, x0b, x1b = y0, y1, x0, x1
+
+    print(f"  Buffer: {buffer_percent if buffer_pixels is None else 'px'} -> {buffer_px} px")
+    print(f"  Buffered region: y=[{y0b}:{y1b}], x=[{x0b}:{x1b}]")
+    print(f"  Final crop size: {y1b - y0b}×{x1b - x0b} pixels")
+
+    # --- 5) Crop ---
+    A_crop = A[y0b:y1b, x0b:x1b]
+    B_crop = B_aligned[y0b:y1b, x0b:x1b]
+
+    return {
+        "A_crop": A_crop,
+        "B_crop": B_crop,
+        "shift": (dy, dx),
+        "bbox": (y0b, y1b, x0b, x1b),
+        "buffer_px": buffer_px,           # YENİ: raporlama için
+    }
+
+
 
 # ============================================================================
 # K-SWEEP EVALUATION
 # ============================================================================
 
 def evaluate_k_sweep(real_raw: np.ndarray,
-                    synthetic_norm: np.ndarray,
-                    img_stem: str,
-                    mode: str = "uncropped",
-                    buffer_percent: float = 5.0,
-                    verbose: bool = False) -> Dict:
+                     synthetic_norm: np.ndarray,
+                     img_stem: str,
+                     mode: str = "uncropped",
+                     buffer_pixels: Optional[int] = None,
+                     buffer_ratio: Optional[float] = None,
+                     buffer_percent: float = 5.0,
+                     verbose: bool = False,
+                     alignment_strategy: str = "once",
+                     prescan_step: int = 0) -> Dict:
     """
-    Perform k-value sweep to find optimal normalization for real image.
+    Perform k-value sweep with alignment-based cropping.
     
-    This function:
-    1. Determines k-range for the IMG (custom or default)
-    2. For each k value, normalizes real image with [k, 100] percentiles
-    3. Optionally crops to valid regions (mode="cropped")
-    4. Computes SSIM, RMSE, and histogram correlation
-    5. Identifies best k for SSIM and RMSE
+    UPDATED: Now uses phase cross-correlation alignment instead of masked region detection.
     
     Args:
         real_raw: Raw real image (uint16 or float32)
         synthetic_norm: Normalized synthetic image [0, 1]
-        img_stem: IMG filename stem (for k-range lookup)
-        mode: Comparison mode - "uncropped" or "cropped"
-        buffer_percent: Buffer percentage for masked region detection (cropped mode)
-        verbose: If True, prints progress updates
+        img_stem: IMG filename stem
+        mode: "uncropped" or "cropped"
+            - uncropped: Direct comparison after normalization
+            - cropped: Phase correlation alignment + overlap crop with buffer
+        buffer_percent: Buffer percentage for overlap expansion (default: 5.0%)
+        verbose: Verbose output
         
     Returns:
-        Dictionary with:
-        - 'k_range': (k_min, k_max) used
-        - 'all_results': List of dicts with k, ssim, rmse, hist_corr for each k
-        - 'best_ssim_k': k value with highest SSIM
-        - 'best_ssim_score': Best SSIM score
-        - 'best_rmse_k': k value with lowest RMSE
-        - 'best_rmse_score': Best RMSE score
-        - 'mode': Comparison mode used
-        - 'cropped_shape': Shape after cropping (if mode="cropped")
-        
-    Example:
-        >>> real_raw = np.array(Image.open("real_filtered.tif"), dtype=np.uint16)
-        >>> synth_norm = np.array(Image.open("synthetic_norm.tif"), dtype=np.float32)
-        >>> results = evaluate_k_sweep(
-        ...     real_raw, synth_norm,
-        ...     img_stem="H9463_0050_SR2",
-        ...     mode="cropped"
-        ... )
-        >>> print(f"Best SSIM: {results['best_ssim_score']:.4f} at k={results['best_ssim_k']}")
+        Dictionary with evaluation results
     """
     if mode not in {"uncropped", "cropped"}:
         raise ValueError(f"Invalid mode: {mode}. Must be 'uncropped' or 'cropped'")
-    
-    # Get k-range for this IMG
+
     k_min, k_max = get_k_range(img_stem)
     k_values = list(range(k_min, k_max + 1, K_STEP))
-    
+
     print(f"\n{'='*80}")
     print(f"K-Sweep Evaluation: {img_stem}")
     print(f"Mode: {mode}")
     print(f"K-range: {k_min} to {k_max} (step {K_STEP})")
-    print(f"{'='*80}")
-    
-    # Convert raw to float32 if needed
-    real_raw_f32 = real_raw.astype(np.float32)
-    
-    # For cropped mode, detect valid region from synthetic once
     if mode == "cropped":
-        valid_mask = detect_masked_regions(synthetic_norm, buffer_percent=buffer_percent)
-        valid_pixels = valid_mask.sum()
-        total_pixels = valid_mask.size
-        print(f"Valid region: {valid_pixels}/{total_pixels} pixels "
-              f"({100.0 * valid_pixels / total_pixels:.1f}%)")
-    
-    # Storage for results
-    all_results = []
-    best_ssim = -np.inf
-    best_ssim_k = None
-    best_rmse = np.inf
-    best_rmse_k = None
-    
-    # Progress tracking
-    total_k = len(k_values)
-    
-    for idx, k in enumerate(k_values, start=1):
-        # Normalize real image with this k value
-        real_norm = normalize_image(real_raw_f32, low_p=float(k), high_p=100.0)
-        
-        if real_norm is None:
-            if verbose:
-                print(f"[k={k:3d}] Normalization failed")
-            continue
-        
-        # Apply cropping if requested
-        if mode == "cropped":
-            real_comp, synth_comp = crop_to_valid_region(real_norm, synthetic_norm, valid_mask)
-            cropped_shape = real_comp.shape
+        H, W = real_raw.shape
+        est_buf_px = int(round((buffer_percent/100.0) * max(H, W)))
+        print("Alignment method: Phase cross-correlation")
+        print(f"Buffer: {buffer_percent}% ≈ {est_buf_px} px")
+    print(f"{'='*80}")
+
+    real_raw_f32 = real_raw.astype(np.float32)
+
+    # ---- TEK KEZ HİZALAMA (alignment_strategy='once') ----
+    synth_crop_ref = None
+    crop_bbox = None
+    if mode == "cropped" and alignment_strategy == "once":
+        # k_ref seç: prescan varsa hızlıca, yoksa orta değer
+        if prescan_step and prescan_step > 1:
+            probe = list(range(k_min, k_max + 1, prescan_step))
+            best_s, k_ref = -np.inf, (k_min + k_max) // 2
+            for kk in probe:
+                rn = normalize_image(real_raw_f32, low_p=float(kk), high_p=100.0)
+                if rn is None:
+                    continue
+                try:
+                    ar = align_and_crop_with_buffer(rn, synthetic_norm,
+                                                    buffer_pixels=None,
+                                                    buffer_percent=buffer_percent,
+                                                    mask_threshold=0.02,
+                                                    upsample_factor=50,
+                                                    interpolation_order=1)
+                    s_tmp, _, _ = compute_metrics(ar["A_crop"], ar["B_crop"])
+                    if np.isfinite(s_tmp) and s_tmp > best_s:
+                        best_s, k_ref = s_tmp, kk
+                except:
+                    pass
         else:
-            real_comp = real_norm
-            synth_comp = synthetic_norm
-            cropped_shape = None
-        
-        # Compute metrics
-        try:
-            s_val, r_val, h_val = compute_metrics(real_comp, synth_comp)
-        except Exception as e:
-            if verbose:
-                print(f"[k={k:3d}] Metrics failed: {e}")
+            k_ref = (k_min + k_max) // 2
+
+        real_ref = normalize_image(real_raw_f32, low_p=float(k_ref), high_p=100.0)
+        ar = align_and_crop_with_buffer(real_ref, synthetic_norm,
+                                        buffer_pixels=None,
+                                        buffer_percent=buffer_percent,
+                                        mask_threshold=0.02,
+                                        upsample_factor=50,
+                                        interpolation_order=1)
+        (dy, dx) = ar["shift"]
+        (y0b, y1b, x0b, x1b) = ar["bbox"]
+
+        # synth’i bir kez warpla ve sabit ROI hazırla
+        tform = AffineTransform(translation=(dx, dy))
+        synth_aligned = warp(synthetic_norm,
+                             inverse_map=tform.inverse,
+                             output_shape=real_raw.shape,
+                             preserve_range=True,
+                             mode="constant", cval=np.nan, order=1).astype("float32")
+        synth_crop_ref = synth_aligned[y0b:y1b, x0b:x1b]
+        crop_bbox = (y0b, y1b, x0b, x1b)
+
+    all_results = []
+    best_ssim, best_ssim_k = -np.inf, None
+    best_rmse, best_rmse_k = np.inf, None
+    cropped_shape = None
+
+    for idx, k in enumerate(k_values, start=1):
+        real_norm = normalize_image(real_raw_f32, low_p=float(k), high_p=100.0)
+        if real_norm is None:
+            if verbose: print(f"[k={k:3d}] Normalization failed")
             continue
-        
-        # Store result
-        all_results.append({
-            'k': k,
-            'ssim': s_val,
-            'rmse': r_val,
-            'hist_corr': h_val
-        })
-        
-        # Track best scores
+
+        if mode == "cropped":
+            if alignment_strategy == "once" and crop_bbox is not None:
+                y0b, y1b, x0b, x1b = crop_bbox
+                real_comp  = real_norm[y0b:y1b, x0b:x1b]
+                synth_comp = synth_crop_ref
+                cropped_shape = real_comp.shape
+            else:
+                ar = align_and_crop_with_buffer(real_norm, synthetic_norm,
+                                                buffer_pixels=None,
+                                                buffer_percent=buffer_percent,
+                                                mask_threshold=0.02,
+                                                upsample_factor=100,
+                                                interpolation_order=1)
+                real_comp, synth_comp = ar["A_crop"], ar["B_crop"]
+                cropped_shape = real_comp.shape
+        else:
+            real_comp, synth_comp = real_norm, synthetic_norm
+
+        s_val, r_val, h_val = compute_metrics(real_comp, synth_comp)
+        all_results.append({'k': k, 'ssim': s_val, 'rmse': r_val, 'hist_corr': h_val})
+
         if np.isfinite(s_val) and s_val > best_ssim:
-            best_ssim = s_val
-            best_ssim_k = k
-        
+            best_ssim, best_ssim_k = s_val, k
         if np.isfinite(r_val) and r_val < best_rmse:
-            best_rmse = r_val
-            best_rmse_k = k
-        
-        # Progress update
-        if verbose or (idx % 10 == 0) or (idx == total_k):
-            pct = 100.0 * idx / total_k
-            print(f"[{pct:5.1f}%] k={k:3d} | SSIM={s_val:.4f} | RMSE={r_val:.4f} | "
-                  f"Hist_Corr={h_val:.4f}", end="\r")
-    
-    print()  # Newline after progress
-    
-    # Summary
-    print(f"\n{'='*80}")
-    print(f"Results Summary:")
+            best_rmse, best_rmse_k = r_val, k
+
+        if verbose or (idx % 10 == 0) or (idx == len(k_values)):
+            pct = 100.0 * idx / len(k_values)
+            print(f"[{pct:5.1f}%] k={k:3d} | SSIM={s_val:.4f} | RMSE={r_val:.4f} | Hist_Corr={h_val:.4f}", end="\r")
+
+    print("\n\n" + "="*80)
+    print("Results Summary:")
     print(f"  Best SSIM: {best_ssim:.6f} at k={best_ssim_k}")
     print(f"  Best RMSE: {best_rmse:.6f} at k={best_rmse_k}")
-    print(f"{'='*80}\n")
-    
+    if mode == "cropped":
+        print(f"  Alignment: Phase cross-correlation (strategy={alignment_strategy})")
+    print("="*80 + "\n")
+
     return {
         'img_stem': img_stem,
         'k_range': (k_min, k_max),
@@ -423,20 +517,111 @@ def evaluate_k_sweep(real_raw: np.ndarray,
         'best_rmse_k': best_rmse_k,
         'best_rmse_score': best_rmse,
         'mode': mode,
-        'cropped_shape': cropped_shape
+        'cropped_shape': cropped_shape,
+        'alignment_method': 'phase_correlation' if mode == 'cropped' else 'none',
+        'buffer_pixels': None,
+        'buffer_source': None
     }
 
+def evaluate_k(real_raw: np.ndarray,
+               synthetic_norm: np.ndarray,
+               img_stem: str,
+               mode: str = "uncropped",
+               buffer_pixels: Optional[int] = None,
+               buffer_ratio: Optional[float] = None,
+               buffer_percent: float = 5.0,
+               verbose: bool = False,
+               k_mode: str = "sweep",
+               learned_k_db: Optional[Dict[str, int]] = None,
+               guard_ssim: float = 0.70,
+               fallback_delta: int = 5) -> Dict:
+    """
+    'Öğrenilmiş k' desteği:
+    - k_mode='learned' ve learned_k_db[img_stem] varsa önce tek k denenir.
+    - SSIM < guard_ssim olursa k_star±delta dar bant sweep'e düşer.
+    - Yoksa normal sweep.
+    - Başardığında learned_k_db[img_stem] güncellenir.
+    """
+    def _update_db(k_best: int):
+        if learned_k_db is not None:
+            learned_k_db[img_stem] = int(k_best)
+
+    # 1) Öğrenilmiş k varsa hızlı kontrol
+    if k_mode == "learned" and learned_k_db is not None and img_stem in learned_k_db:
+        k_star = int(learned_k_db[img_stem])
+        real_raw_f32 = real_raw.astype(np.float32)
+        try:
+            rn = normalize_image(real_raw_f32, float(k_star))
+            if mode == "cropped":
+                ar = align_and_crop_with_buffer(
+                    rn, synthetic_norm,
+                    buffer_pixels=None,
+                    buffer_percent=buffer_percent,
+                    mask_threshold=0.02,
+                    upsample_factor=50,
+                    interpolation_order=1
+                )
+                s_val, r_val, h_val = compute_metrics(ar["A_crop"], ar["B_crop"])
+                if np.isfinite(s_val) and s_val >= guard_ssim:
+                    _update_db(k_star)
+                    return {
+                        'img_stem': img_stem, 'k_range': (k_star, k_star),
+                        'all_results': [{'k': k_star, 'ssim': s_val, 'rmse': r_val, 'hist_corr': h_val}],
+                        'best_ssim_k': k_star, 'best_ssim_score': s_val,
+                        'best_rmse_k': k_star, 'best_rmse_score': r_val,
+                        'mode': mode, 'cropped_shape': ar["A_crop"].shape,
+                        'alignment_method': 'phase_correlation'
+                    }
+            else:
+                s_val, r_val, h_val = compute_metrics(rn, synthetic_norm)
+                if np.isfinite(s_val) and s_val >= guard_ssim:
+                    _update_db(k_star)
+                    return {
+                        'img_stem': img_stem, 'k_range': (k_star, k_star),
+                        'all_results': [{'k': k_star, 'ssim': s_val, 'rmse': r_val, 'hist_corr': h_val}],
+                        'best_ssim_k': k_star, 'best_ssim_score': s_val,
+                        'best_rmse_k': k_star, 'best_rmse_score': r_val,
+                        'mode': mode, 'cropped_shape': None,
+                        'alignment_method': 'none'
+                    }
+        except Exception as e:
+            if verbose:
+                print(f"[learned-k] quick check failed, falling back to short sweep: {e}")
+
+        # 2) Guard tutmadı → ±delta kısa sweep
+        k_min = max(0, k_star - fallback_delta)
+        k_max = min(100, k_star + fallback_delta)
+        global K_DEFAULT_RANGE
+        old_range = K_DEFAULT_RANGE
+        K_DEFAULT_RANGE = (k_min, k_max)
+        res = evaluate_k_sweep(
+            real_raw, synthetic_norm, img_stem, mode,
+            buffer_pixels, buffer_ratio, buffer_percent, verbose
+        )
+        K_DEFAULT_RANGE = old_range
+        _update_db(int(res['best_ssim_k']))
+        return res
+
+    # 3) İlk kullanım ya da k_mode='sweep' → normal sweep
+    res = evaluate_k_sweep(
+        real_raw, synthetic_norm, img_stem, mode,
+        buffer_pixels, buffer_ratio, buffer_percent, verbose
+    )
+    _update_db(int(res['best_ssim_k']))
+    return res
 
 # ============================================================================
 # CONVENIENCE FUNCTIONS
 # ============================================================================
 
 def evaluate_image_pair(real_path: Path,
-                       synthetic_path: Path,
-                       img_stem: str,
-                       mode: str = "uncropped",
-                       buffer_percent: float = 5.0,
-                       verbose: bool = False) -> Dict:
+                        synthetic_path: Path,
+                        img_stem: str,
+                        mode: str = "uncropped",
+                        buffer_pixels: Optional[int] = None,
+                        buffer_ratio: Optional[float] = None,
+                        buffer_percent: float = 5.0,
+                        verbose: bool = False) -> Dict:
     """
     Evaluate a real-synthetic image pair with k-sweep.
     
@@ -491,15 +676,18 @@ def evaluate_image_pair(real_path: Path,
         return {'error': f'Shape mismatch: {real_img.shape} vs {synth_img.shape}'}
     
     # Perform k-sweep
-    results = evaluate_k_sweep(
-        real_raw=real_img,
+    results = evaluate_k(
+        real_raw=filtered_img,
         synthetic_norm=synth_img,
         img_stem=img_stem,
-        mode=mode,
-        buffer_percent=buffer_percent,
-        verbose=verbose
+        mode=eval_mode,
+        buffer_percent=BUFFER_PERCENT,
+        verbose=VERBOSE,
+        k_mode="learned",            # "sweep" dersen eski davranış
+        learned_k_db=LEARNED_K_DB,   # burada güncellenecek
+        guard_ssim=0.70,             # gerekirse değiştir
+        fallback_delta=5
     )
-    
     return results
 
 

@@ -3,11 +3,11 @@
 phobos_main.py
 Phobos Photometric Template Generator - Main Execution Module
 
-Tasks:
-- Main execution loop
-- PDS ve SPICE Coordination
-- Render Mang.
-- Labelling
+Sorumluluklar:
+- Ana execution loop
+- PDS ve SPICE koordinasyonu
+- Render yönetimi
+- Sonuç toplama ve kaydetme
 - CLI interface
 """
 
