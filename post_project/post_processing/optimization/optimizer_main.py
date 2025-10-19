@@ -19,6 +19,7 @@ Usage:
 import argparse
 import json
 import sys
+import openpyxl
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -28,7 +29,8 @@ from optimization_helper import (
     OptimizationLogger,
     evaluate_params_with_rendering,
     print_params_table,
-    PARAMETER_BOUNDS
+    PARAMETER_BOUNDS,
+    with_eval_logging
 )
 
 from PSO import run_pso
@@ -188,15 +190,14 @@ DEFAULT_CONFIG = {
     'pso': {
         'n_particles': 30,
         'n_iterations': 100,
-        'w': 0.7,
-        'w_min': 0.4,
-        'w_max': 0.9,
-        'c1': 1.5,
-        'c2': 1.5,
-        'v_max_factor': 0.2,
-        'boundary_method': 'clip',
+        'w_min': 0.4,      # LDIW: lineer azalan inertia (sona doğru 0.4)
+        'w_max': 0.9,      # LDIW: başlangıçta 0.9
+        'c1': 2.0,         # LDIW ile uyumlu hızlandırmalar
+        'c2': 2.0,
+        'v_max_factor': 0.13,
+        'boundary_method': 'reflect',
         'convergence_threshold': 1e-6,
-        'convergence_patience': 10,
+        'convergence_patience': 1000000,
         'seed': None
     },
     
@@ -205,13 +206,13 @@ DEFAULT_CONFIG = {
         'n_generations': 100,
         'crossover_prob': 0.9,
         'mutation_prob': 0.1,
-        'crossover_eta': 20.0,
+        'crossover_eta': 20.        0,
         'mutation_eta': 20.0,
         'tournament_size': 3,
         'elitism_count': 2,
         'boundary_method': 'clip',
         'convergence_threshold': 1e-6,
-        'convergence_patience': 10,
+        'convergence_patience': 1000000000,
         'seed': None
     },
     
@@ -231,7 +232,6 @@ def create_objective_function(config: Dict, img_info_list: List[Dict]):
     """Create objective function from configuration."""
     
     particle_counter = {'count': 0}
-    # Run boyunca k değerlerini cache'lemek için bellek içi DB
     learned_k_db: Dict[str, int] = {}
     
     def objective_function(params):
@@ -247,14 +247,21 @@ def create_objective_function(config: Dict, img_info_list: List[Dict]):
             particle_id=particle_id,
             temp_dir=Path(config.get('temp_dir', 'optimization_temp')),
             verbose=config.get('verbose_eval', False),
-            # k araması için yeni opsiyonlar
             k_mode=config.get('k_mode', 'learned'),
             learned_k_db=learned_k_db,
             blender_persistent=config.get('blender_persistent', True),
             blender_batch_size=config.get('blender_batch_size', None),
         )
     
-    return objective_function
+    # Wrapped objective with logging - img_info_list eklendi
+    wrapped_objective = with_eval_logging(
+        objective_fn=objective_function,
+        pop_size=config[config['algorithm']].get('n_particles' if config['algorithm'] == 'pso' else 'population_size', 30),
+        img_info_list=img_info_list,  # ← YENİ PARAMETRE
+        csv_dir=Path(config.get('temp_dir', 'optimization_temp'))
+    )
+    
+    return wrapped_objective
 
 
 # ============================================================================
@@ -266,21 +273,21 @@ def main():
         description="Photometric Parameter Optimization with Automatic PDS Scanning",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  # Automatic scanning of all IMG files in PDS_Data
-  python optimizer_main.py --algorithm pso --pds-dir PDS_Data
-  
-  # Limit to first 3 images
-  python optimizer_main.py --algorithm pso --pds-dir PDS_Data --max-images 3
-  
-  # Filter by pattern
-  python optimizer_main.py --algorithm pso --pds-dir PDS_Data --img-pattern "H9463*"
-  
-  # Genetic Algorithm with config file
-  python optimizer_main.py --algorithm genetic --config my_config.json --pds-dir PDS_Data
-  
-  # Custom settings
-  python optimizer_main.py \\
+    Examples:
+    # Automatic scanning of all IMG files in PDS_Data
+    python optimizer_main.py --algorithm pso --pds-dir PDS_Data
+    
+    # Limit to first 3 images
+    python optimizer_main.py --algorithm pso --pds-dir PDS_Data --max-images 3
+    
+    # Filter by pattern
+    python optimizer_main.py --algorithm pso --pds-dir PDS_Data --img-pattern "H9463*"
+    
+    # Genetic Algorithm with config file
+    python optimizer_main.py --algorithm genetic --config my_config.json --pds-dir PDS_Data
+    
+    # Custom settings
+    python optimizer_main.py \\
       --algorithm pso \\
       --pds-dir PDS_Data \\
       --max-images 5 \\
@@ -514,6 +521,13 @@ Examples:
         
         else:
             raise ValueError(f"Unknown algorithm: {algorithm}")
+        
+        # ========== Save XLSX (YENİ) ==========
+        if hasattr(objective_function, 'save_xlsx'):
+            objective_function.save_xlsx()
+        
+        if hasattr(objective_function, 'csv_file') and objective_function.csv_file:
+            objective_function.csv_file.close()
         
         # ========== Save Results ==========
         logger.log("\n" + "="*80)

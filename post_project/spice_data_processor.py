@@ -47,7 +47,7 @@ class SpiceDataProcessor:
         self.STATIC_KERNELS = [
             "generic_kernels/lsk/naif0012.tls",
             "generic_kernels/pck/pck00010.tpc",
-            "MEX/kernels/sclk/MEX_250905_STEP.TSC",
+            "MEX/kernels/sclk/MEX_250915_STEP.TSC",
             "MEX/kernels/fk/MEX_V16.TF",
             "MEX/kernels/ik/MEX_HRSC_V09.TI",  # IK kernel for camera parameters
             "MEX/kernels/spk/MEX_STRUCT_V01.BSP",

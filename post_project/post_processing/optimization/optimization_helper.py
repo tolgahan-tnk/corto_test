@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Dict, List, Tuple, Optional, Callable, Union
 import json
 import matplotlib.pyplot as plt
+import openpyxl 
 import sys
 import os
 
@@ -559,6 +560,7 @@ def evaluate_params_with_rendering(params,
 # ============================================================================
 def with_eval_logging(objective_fn: Callable,
                       pop_size: int,
+                      img_info_list: list,
                       csv_dir: Optional[Union[Path, str]] = None):
     """
     objective_fn: mevcut objective (params -> float)
@@ -571,22 +573,34 @@ def with_eval_logging(objective_fn: Callable,
     """
     eval_idx = 0
     csv_f = None
+    xlsx_path = None
+    records = []  # XLSX için kayıtlar
+    
     if csv_dir:
         csv_dir = Path(csv_dir)
         csv_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         csv_path = csv_dir / f"eval_history_{stamp}.csv"
+        xlsx_path = csv_dir / f"eval_history_{stamp}.xlsx"
+        
         csv_f = open(csv_path, "w", buffering=1)
-        print("iteration,particle,objective,nmrse,ssim", file=csv_f)
+        # Genişletilmiş header
+        header = "iteration,particle,objective,nmrse,ssim,base_gray,tex_mix,oren_rough,princ_rough,shader_mix,ior,q_eff,img_files"
+        print(header, file=csv_f)
+    
+    # IMG dosya adlarını birleştir
+    img_names = "; ".join([info['filename'] for info in img_info_list])
 
     def wrapped(x):
-        nonlocal eval_idx, csv_f
+        nonlocal eval_idx, csv_f, records
         ps = max(1, int(pop_size))
         it  = eval_idx // ps
         pid = eval_idx %  ps
 
         if pid == 0:
-            print(f"\n=== Iteration {it} ===")
+            print(f"\n{'='*100}")
+            print(f"=== Iteration {it} ===")
+            print(f"{'='*100}")
 
         val = objective_fn(x)
 
@@ -597,12 +611,55 @@ def with_eval_logging(objective_fn: Callable,
         except Exception:
             nmrse, ssim = float("nan"), float("nan")
 
+        # Parametreleri al
+        params_dict = params_to_dict(x)
+        
+        # Konsol çıktısı - genişletilmiş
         print(f"[it {it:03d} | p{pid:03d}] obj={val:+.6f}  NMRSE={nmrse:.6f}  SSIM={ssim:.6f}")
+        print(f"  Params: base_gray={params_dict['base_gray']:.4f}, tex_mix={params_dict['tex_mix']:.4f}, "
+              f"oren_rough={params_dict['oren_rough']:.4f}, princ_rough={params_dict['princ_rough']:.4f}")
+        print(f"          shader_mix={params_dict['shader_mix']:.4f}, ior={params_dict['ior']:.4f}, "
+              f"q_eff={params_dict['q_eff']:.4f}")
+        print(f"  IMG Files: {img_names}")
+        
+        # CSV kaydı
         if csv_f:
-            print(f"{it},{pid},{val},{nmrse},{ssim}", file=csv_f)
+            csv_line = (f"{it},{pid},{val},{nmrse},{ssim},"
+                       f"{params_dict['base_gray']},{params_dict['tex_mix']},"
+                       f"{params_dict['oren_rough']},{params_dict['princ_rough']},"
+                       f"{params_dict['shader_mix']},{params_dict['ior']},"
+                       f"{params_dict['q_eff']},\"{img_names}\"")
+            print(csv_line, file=csv_f)
+            
+            # XLSX için kayıt
+            record = {
+                'iteration': it,
+                'particle': pid,
+                'objective': val,
+                'nmrse': nmrse,
+                'ssim': ssim,
+                **params_dict,
+                'img_files': img_names
+            }
+            records.append(record)
+        
         eval_idx += 1
         return val
-
+    
+    # XLSX kaydetme fonksiyonu
+    def save_xlsx():
+        if xlsx_path and records:
+            try:
+                df = pd.DataFrame(records)
+                df.to_excel(xlsx_path, index=False, engine='openpyxl')
+                print(f"\n✅ XLSX saved: {xlsx_path}")
+            except Exception as e:
+                print(f"⚠️ XLSX save failed: {e}")
+    
+    # Cleanup için wrapper'a attribute ekle
+    wrapped.save_xlsx = save_xlsx
+    wrapped.csv_file = csv_f
+    
     return wrapped
 
 # ============================================================================
