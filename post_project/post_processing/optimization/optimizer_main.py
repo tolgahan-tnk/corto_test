@@ -206,7 +206,7 @@ DEFAULT_CONFIG = {
         'n_generations': 100,
         'crossover_prob': 0.9,
         'mutation_prob': 0.1,
-        'crossover_eta': 20.        0,
+        'crossover_eta': 20.0,
         'mutation_eta': 20.0,
         'tournament_size': 3,
         'elitism_count': 2,
