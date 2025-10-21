@@ -296,7 +296,7 @@ def evaluate_params_with_rendering(params,
             elif objective_type == 'combined':
                 ssim_best = float(eval_res['best_ssim_score'])
                 rmse_best = float(eval_res['best_rmse_score'])
-                obj_val = (1.0 - ssim_best) + rmse_best
+                obj_val = (1.0 - ssim_best) + rmse_best*(1/3) #weigh is 1/3 for rmse
             else:
                 raise ValueError(f"Unknown objective: {objective_type}")
             

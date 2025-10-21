@@ -194,7 +194,7 @@ DEFAULT_CONFIG = {
         'w_max': 0.8,      # LDIW: başlangıçta 0.9
         'c1': 2.0,         # LDIW ile uyumlu hızlandırmalar
         'c2': 2.0,
-        'v_max_factor': 0.2,
+        'v_max_factor': 0.15,
         'boundary_method': 'reflect',
         'convergence_threshold': 1e-6,
         'convergence_patience': 1000000,
@@ -218,7 +218,7 @@ DEFAULT_CONFIG = {
     
     'output_dir': 'optimization_results',
     'experiment_name': 'phobos_optimization',
-    'temp_dir': 'optimization_temp',
+    'temp_dir': str(Path(r"D:/CORTO/optimization_temp_combined")), #'optimization_temp',
     'save_plots': True,
     'verbose_eval': False
 }
