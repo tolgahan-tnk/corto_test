@@ -133,6 +133,9 @@ def build_param_grid(n_templates, ranges=None):
         'shader_mix': (0.0, 1.0),
         'ior': (1.33, 1.79),  # IOR taraması
         'q_eff': (0.7, 1.4),
+        'threshold_value': (0.0, 0.15),
+        'mars_rough': (0.0, 1.0),
+        'mars_albedo_mul': (0.0, 2.0),
     }
     
     if ranges:

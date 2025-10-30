@@ -52,7 +52,9 @@ PARAMETER_BOUNDS = {
     'shader_mix': (0.0, 1.0),
     'ior': (1.33, 1.79),
     'q_eff': (0.7, 1.4),
-    'threshold_value': (0.0, 0.15),
+    'threshold_value': (0.0, 0.1),
+    'mars_rough': (0.0, 1.0),
+    'mars_albedo_mul': (0.0, 2.0),
 }
 
 PARAMETER_NAMES = list(PARAMETER_BOUNDS.keys())
@@ -140,7 +142,7 @@ def evaluate_params_with_rendering(params,
     2. Comparing with real IMG files
     
     Args:
-        params: Parameter array [7 values]
+        params: Parameter array [10 values]
         img_info_list: List of IMG info dicts
         objective_type: 'ssim', 'rmse', 'nmrse', 'combined'
         mode: 'cropped' or 'uncropped'
@@ -634,7 +636,8 @@ def with_eval_logging(objective_fn: Callable,
         
         csv_f = open(csv_path, "w", buffering=1)
         # Genişletilmiş header
-        header = "iteration,particle,objective,nmrse,ssim,base_gray,tex_mix,oren_rough,princ_rough,shader_mix,ior,q_eff,img_files"
+        header = ("iteration,particle,objective,nmrse,ssim,base_gray,tex_mix,oren_rough,princ_rough,"
+                  "shader_mix,ior,q_eff,threshold_value,mars_rough,mars_albedo_mul,img_files")
         print(header, file=csv_f)
     
     # IMG dosya adlarını birleştir
@@ -668,7 +671,8 @@ def with_eval_logging(objective_fn: Callable,
         print(f"  Params: base_gray={params_dict['base_gray']:.4f}, tex_mix={params_dict['tex_mix']:.4f}, "
               f"oren_rough={params_dict['oren_rough']:.4f}, princ_rough={params_dict['princ_rough']:.4f}")
         print(f"          shader_mix={params_dict['shader_mix']:.4f}, ior={params_dict['ior']:.4f}, "
-              f"q_eff={params_dict['q_eff']:.4f}")
+              f"q_eff={params_dict['q_eff']:.4f}, threshold={params_dict['threshold_value']:.4f}, "
+              f"mars_rough={params_dict['mars_rough']:.4f}, mars_albedo_mul={params_dict['mars_albedo_mul']:.4f}")
         print(f"  IMG Files: {img_names}")
         
         # CSV kaydı
@@ -677,7 +681,8 @@ def with_eval_logging(objective_fn: Callable,
                        f"{params_dict['base_gray']},{params_dict['tex_mix']},"
                        f"{params_dict['oren_rough']},{params_dict['princ_rough']},"
                        f"{params_dict['shader_mix']},{params_dict['ior']},"
-                       f"{params_dict['q_eff']},\"{img_names}\"")
+                       f"{params_dict['q_eff']},{params_dict['threshold_value']},"
+                       f"{params_dict['mars_rough']},{params_dict['mars_albedo_mul']},\"{img_names}\"")
             print(csv_line, file=csv_f)
             
             # XLSX için kayıt

@@ -129,7 +129,7 @@ class CORTORenderer:
         """
         self.scenario_name = scenario_name
         self.body_files = body_files or [
-            "g_phobos_036m_spc_0000n00000_v002.obj",
+            "g_phobos_018m_spc_0000n00000_v002.obj",
             "Mars_65k.obj",
             "g_deimos_162m_spc_0000n00000_v001.obj",
         ]
@@ -246,7 +246,7 @@ class CORTORenderer:
                 - 'filename': IMG filename
                 - 'utc_time': UTC timestamp
                 - 'solar_distance_km': Distance to sun
-            params: Photometric parameter array [8 values]
+            params: Photometric parameter array [10 values]
             output_path: Where to save rendered PNG
             
         Returns:
@@ -313,7 +313,8 @@ class CORTORenderer:
     def _params_to_dict(self, params: np.ndarray) -> Dict[str, float]:
         """Convert parameter array to dictionary."""
         param_names = ['base_gray', 'tex_mix', 'oren_rough', 'princ_rough',
-                       'shader_mix', 'ior', 'q_eff', 'threshold_value']
+                       'shader_mix', 'ior', 'q_eff', 'threshold_value',
+                       'mars_rough', 'mars_albedo_mul']
         return {name: float(val) for name, val in zip(param_names, params)}
     
     def cleanup_temp(self):
@@ -347,7 +348,7 @@ def render_synthetic_for_params(
     
     Args:
         img_info_list: List of IMG info dicts (filename, utc_time, etc.)
-        params: Photometric parameters [7 values]
+        params: Photometric parameters [10 values]
         output_dir: Directory for output files
         particle_id: Particle/individual ID for naming
         

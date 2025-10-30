@@ -220,6 +220,32 @@ def build_scene_and_materials(State, body_names):
     material_3 = corto.Shading.create_new_material('Deimos_Standard')
     corto.Shading.create_branch_albedo_mix(material_2, State, 2)
     corto.Shading.create_branch_albedo_mix(material_3, State, 3)
+
+    # Mars material için Oren-Nayar (Diffuse) + albedo çarpanı kurulumu
+    mars_nodes = material_2.node_tree.nodes
+    mars_links = material_2.node_tree.links
+    mars_diffuse = next((n for n in mars_nodes if getattr(n, "bl_idname", "") == 'ShaderNodeBsdfDiffuse'), None)
+    mars_mix_shader = next((n for n in mars_nodes if getattr(n, "bl_idname", "") == 'ShaderNodeMixShader'), None)
+    mars_texture = next((n for n in mars_nodes if getattr(n, "bl_idname", "") == 'ShaderNodeTexImage'), None)
+    mars_multiplier = None
+
+    if mars_mix_shader:
+        mars_mix_shader.inputs[0].default_value = 0.0  # Principled katkısını kapat
+
+    if mars_diffuse and mars_texture:
+        mars_multiplier = mars_nodes.new('ShaderNodeVectorMath')
+        mars_multiplier.operation = 'MULTIPLY'
+        mars_multiplier.location = (-200, 50)
+        mars_multiplier.inputs[1].default_value = (1.0, 1.0, 1.0)
+
+        for link in list(mars_links):
+            if link.to_node == mars_diffuse and getattr(link.to_socket, 'name', '') == 'Color':
+                mars_links.remove(link)
+
+        mars_links.new(mars_texture.outputs['Color'], mars_multiplier.inputs[0])
+        mars_links.new(mars_multiplier.outputs['Vector'], mars_diffuse.inputs['Color'])
+        mars_diffuse.inputs['Roughness'].default_value = 0.5
+
     corto.Shading.load_uv_data(body_2, State, 2)
     corto.Shading.assign_material_to_object(material_2, body_2)
     corto.Shading.load_uv_data(body_3, State, 3)
@@ -280,6 +306,12 @@ def build_scene_and_materials(State, body_names):
         'mix_shader_node': mix_shader_node,
     }
 
+    if mars_diffuse:
+        mat_nodes['mars_diffuse_node'] = mars_diffuse
+    if mars_multiplier:
+        mat_nodes['mars_albedo_multiplier'] = mars_multiplier
+
+
     return ENV, cam, sun, (body_1, body_2, body_3), mat_nodes, tree
 
 
@@ -321,6 +353,21 @@ def set_phobos_params(mat_nodes, params):
         if slot in mat_nodes['principled_node'].inputs:
             mat_nodes['principled_node'].inputs[slot].default_value = 0.0
 
+    if 'mars_rough' in params and 'mars_diffuse_node' in mat_nodes:
+        mat_nodes['mars_diffuse_node'].inputs['Roughness'].default_value = float(params['mars_rough'])
+
+    if 'mars_albedo_mul' in params and 'mars_albedo_multiplier' in mat_nodes:
+        mul = float(params['mars_albedo_mul'])
+        try:
+            mat_nodes['mars_albedo_multiplier'].inputs[1].default_value = (mul, mul, mul)
+        except Exception:
+            # Fallback for vector inputs with 4 components
+            vec = getattr(mat_nodes['mars_albedo_multiplier'].inputs[1], 'default_value', None)
+            if vec is not None:
+                try:
+                    vec[:] = (mul, mul, mul)
+                except Exception:
+                    mat_nodes['mars_albedo_multiplier'].inputs[1].default_value = (mul, mul, mul, 1.0)
 
 # ============================================================================
 # ASSET PATH HELPER
@@ -329,7 +376,7 @@ def add_asset_paths(state):
     """Input/UV/albedo varlık yollarını State'e ekler"""
     base = state.path["input_path"]
     state.add_path('albedo_path_1', os.path.join(base, 'body', 'albedo', 'Phobos grayscale.jpg'))
-    state.add_path('uv_data_path_1', os.path.join(base, 'body', 'uv data', 'g_phobos_036m_spc_0000n00000_v002.json'))
+    state.add_path('uv_data_path_1', os.path.join(base, 'body', 'uv data', 'g_phobos_018m_spc_0000n00000_v002.json'))
     state.add_path('albedo_path_2', os.path.join(base, 'body', 'albedo', 'mars_1k_color.jpg'))
     state.add_path('uv_data_path_2', os.path.join(base, 'body', 'uv data', 'Mars_65k.json'))
     state.add_path('albedo_path_3', os.path.join(base, 'body', 'albedo', 'Deimos grayscale.jpg'))

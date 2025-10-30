@@ -218,7 +218,7 @@ DEFAULT_CONFIG = {
     
     'output_dir': 'optimization_results',
     'experiment_name': 'phobos_optimization',
-    'temp_dir': str(Path(r"D:/CORTO/optimization_temp_combined_threshold")), #'optimization_temp',
+    'temp_dir': str(Path(r"D:/CORTO/optimization_temp_combined_threshold_mars_018_2")), #'optimization_temp',
     'save_plots': True,
     'verbose_eval': False
 }
@@ -394,7 +394,7 @@ def main():
     )
     
     # parser = argparse.ArgumentParser(...)
-    parser.add_argument("--blender-batch-size", type=int, default=20,
+    parser.add_argument("--blender-batch-size", type=int, default=100,
                         help="Sahneyi her N renderda bir yeniden kur (persistent cache)")
     parser.add_argument("--k-mode", choices=["sweep","learned"], default="learned",
                         help="k araması: 'sweep' ya da 'learned' (tek k, guard+dar bant teyit)")

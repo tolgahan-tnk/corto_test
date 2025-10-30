@@ -83,7 +83,7 @@ def run_pds_simulations(
     scene_name = "scene_mmx.json"
     geometry_name = "geometry_mmx.json"
     body_name = [
-        "g_phobos_036m_spc_0000n00000_v002.obj",
+        "g_phobos_018m_spc_0000n00000_v002.obj",
         "Mars_65k.obj",
         "g_deimos_162m_spc_0000n00000_v001.obj",
     ]
