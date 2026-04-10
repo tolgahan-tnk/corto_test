@@ -76,55 +76,134 @@ def extract_pds_metadata(pds_path: Path) -> Dict[str, float]:
 
 def load_pds_image_data(pds_path: Path) -> Tuple[Optional[np.ndarray], Dict[str, int]]:
     """
-    Load 16-bit big-endian image data from PDS IMG file.
+    Load image data from PDS IMG file using GDAL.
     
-    Reads the image dimensions and binary data offset from the PDS label,
-    then loads the raw pixel values as a numpy array.
+    Uses GDAL to read the PDS3 file, which correctly handles headers,
+    byte ordering, NoData values, and signed int16 data type.
     
     Args:
         pds_path: Path to PDS IMG file
         
     Returns:
         Tuple of (image_array, image_info)
-        - image_array: uint16 numpy array (H x W), or None if loading fails
-        - image_info: dict with 'lines', 'samples', 'record_bytes', 'image_record'
-        
-    Example:
-        >>> img, info = load_pds_image_data(Path("H9463_0050_SR2.IMG"))
-        >>> print(img.shape)  # (1024, 1024)
-        >>> print(info['lines'])  # 1024
+        - image_array: numpy array (H x W), dtype from GDAL (typically int16)
+        - image_info: dict with 'lines', 'samples'
     """
     try:
-        # Read PDS label to get image parameters
-        content = open(pds_path, 'r', errors='ignore').read()
+        from osgeo import gdal
+        import re as _re
         
-        record_bytes = int(re.search(r"RECORD_BYTES\s*=\s*(\d+)", content).group(1))
-        image_record = int(re.search(r"\^IMAGE\s*=\s*(\d+)", content).group(1))
-        lines = int(re.search(r"LINES\s*=\s*(\d+)", content).group(1))
-        samples = int(re.search(r"LINE_SAMPLES\s*=\s*(\d+)", content).group(1))
+        dataset = gdal.Open(str(pds_path), gdal.GA_ReadOnly)
+        if dataset is None:
+            raise RuntimeError(f"GDAL could not open {pds_path.name}")
         
+        band = dataset.GetRasterBand(1)
+        data = band.ReadAsArray()  # Returns proper signed int16
+        
+        lines, samples = data.shape
         image_info = {
             'lines': lines,
             'samples': samples,
-            'record_bytes': record_bytes,
-            'image_record': image_record
         }
         
-        # Load 16-bit big-endian binary data
-        with open(pds_path, 'rb') as f:
-            # Seek to image data start (image_record is 1-indexed)
-            f.seek((image_record - 1) * record_bytes)
-            
-            # Read as 16-bit big-endian signed integers
-            raw_be = np.fromfile(f, dtype='>i2', count=lines * samples)
+        # Log NoData info
+        nodata = band.GetNoDataValue()
+        if nodata is not None:
+            print(f"  📋 GDAL NoData value: {nodata}")
+        print(f"  📋 GDAL dtype: {data.dtype}, shape: {data.shape}, "
+              f"min={data.min()}, max={data.max()}")
         
-        # Convert to uint16 bit pattern (preserves DN values)
-        raw_uint16 = raw_be.astype(np.uint16).reshape((lines, samples))
+        dataset = None  # Close
         
-        return raw_uint16, image_info
+        # Apply display direction corrections from PDS label
+        content = open(pds_path, 'r', errors='ignore').read(32000)
+        sdd_m = _re.search(r"SAMPLE_DISPLAY_DIRECTION\s*=\s*(\S+)", content)
+        ldd_m = _re.search(r"LINE_DISPLAY_DIRECTION\s*=\s*(\S+)", content)
+        sample_dir = sdd_m.group(1).strip('"').upper() if sdd_m else 'RIGHT'
+        line_dir   = ldd_m.group(1).strip('"').upper() if ldd_m else 'DOWN'
+        if sample_dir == 'LEFT':
+            data = np.fliplr(data)
+            print(f"  [ORIENT] Flipped X (GDAL: SAMPLE_DISPLAY_DIRECTION=LEFT)")
+        if line_dir == 'UP':
+            data = np.flipud(data)
+            print(f"  [ORIENT] Flipped Y (GDAL: LINE_DISPLAY_DIRECTION=UP)")
         
+        return data, image_info
+        
+    except ImportError:
+        print("[WARNING] GDAL not available, falling back to custom parser")
+        return _load_pds_custom(pds_path)
     except Exception as e:
         print(f"[ERROR] Failed to load image data from {pds_path.name}: {e}")
+        return None, {}
+
+
+def _pds_dtype(sample_type: str, sample_bits: int) -> str:
+    """Map PDS SAMPLE_TYPE + SAMPLE_BITS to numpy dtype string."""
+    st = sample_type.strip('"').upper()
+    mapping = {
+        ('MSB_INTEGER', 16):            '>i2',
+        ('LSB_INTEGER', 16):            '<i2',
+        ('MSB_UNSIGNED_INTEGER', 16):   '>u2',
+        ('LSB_UNSIGNED_INTEGER', 16):   '<u2',
+        ('PC_REAL', 32):                '<f4',   # Rosetta OSIRIS
+        ('IEEE_REAL', 32):              '>f4',
+        ('PC_REAL', 64):                '<f8',
+        ('IEEE_REAL', 64):              '>f8',
+        ('MSB_INTEGER', 8):             '>i1',
+        ('UNSIGNED_INTEGER', 8):        'u1',
+    }
+    dtype = mapping.get((st, sample_bits), '>i2')  # HRSC default
+    print(f"  [PDS] dtype: SAMPLE_TYPE={st}, BITS={sample_bits} -> numpy {dtype}")
+    return dtype
+
+
+def _load_pds_custom(pds_path: Path) -> Tuple[Optional[np.ndarray], Dict[str, int]]:
+    """Fallback custom PDS parser when GDAL is not available."""
+    try:
+        import re as _re
+        content = open(pds_path, 'r', errors='ignore').read()
+        
+        record_bytes = int(_re.search(r"RECORD_BYTES\s*=\s*(\d+)", content).group(1))
+        image_record = int(_re.search(r"\^IMAGE\s*=\s*(\d+)", content).group(1))
+        lines = int(_re.search(r"LINES\s*=\s*(\d+)", content).group(1))
+        samples = int(_re.search(r"LINE_SAMPLES\s*=\s*(\d+)", content).group(1))
+        
+        # Detect SAMPLE_TYPE for correct dtype
+        st_match = _re.search(r"SAMPLE_TYPE\s*=\s*(\S+)", content)
+        sb_match = _re.search(r"SAMPLE_BITS\s*=\s*(\d+)", content)
+        sample_type = st_match.group(1) if st_match else 'MSB_INTEGER'
+        sample_bits = int(sb_match.group(1)) if sb_match else 16
+        dtype = _pds_dtype(sample_type, sample_bits)
+        
+        # Detect display direction for orientation correction
+        sdd_match = _re.search(r"SAMPLE_DISPLAY_DIRECTION\s*=\s*(\S+)", content)
+        ldd_match = _re.search(r"LINE_DISPLAY_DIRECTION\s*=\s*(\S+)", content)
+        sample_dir = sdd_match.group(1).strip('"').upper() if sdd_match else 'RIGHT'
+        line_dir = ldd_match.group(1).strip('"').upper() if ldd_match else 'DOWN'
+        
+        image_info = {'lines': lines, 'samples': samples}
+        
+        with open(pds_path, 'rb') as f:
+            f.seek((image_record - 1) * record_bytes)
+            raw = np.fromfile(f, dtype=dtype, count=lines * samples)
+        
+        raw = raw.reshape((lines, samples))
+        
+        # Apply display direction corrections
+        # SAMPLE_DISPLAY_DIRECTION=LEFT means columns stored right-to-left -> flip X
+        if sample_dir == 'LEFT':
+            raw = np.fliplr(raw)
+            print(f"  [ORIENT] Flipped X (SAMPLE_DISPLAY_DIRECTION=LEFT)")
+        # LINE_DISPLAY_DIRECTION=UP means rows stored bottom-to-top -> flip Y
+        if line_dir == 'UP':
+            raw = np.flipud(raw)
+            print(f"  [ORIENT] Flipped Y (LINE_DISPLAY_DIRECTION=UP)")
+        
+        return raw, image_info
+        
+    except Exception as e:
+        print(f"[ERROR] Fallback parser failed for {pds_path.name}: {e}")
         return None, {}
 
 
@@ -132,7 +211,7 @@ def load_pds_image_data(pds_path: Path) -> Tuple[Optional[np.ndarray], Dict[str,
 # HOT PIXEL FILTERING
 # ============================================================================
 
-def compute_dynamic_threshold(img_u16: np.ndarray,
+def compute_dynamic_threshold(img: np.ndarray,
                               n_bins: int = 256,
                               factor: float = 1.5,
                               gap_len: int = 2) -> int:
@@ -146,25 +225,23 @@ def compute_dynamic_threshold(img_u16: np.ndarray,
     4. Single-bin gaps are filled to improve continuity detection
     
     Args:
-        img_u16: Input uint16 image array
+        img: Input image array (int16 or uint16)
         n_bins: Number of histogram bins (default: 256)
         factor: Multiplier for threshold (default: 1.5)
         gap_len: Minimum gap length to consider end of continuity (default: 2)
         
     Returns:
         Dynamic threshold value (int)
-        
-    Example:
-        >>> img = np.array(Image.open("real_raw.tif"), dtype=np.uint16)
-        >>> thr = compute_dynamic_threshold(img)
-        >>> print(f"Hot pixel threshold: {thr}")
-        Hot pixel threshold: 58234
     """
-    DN_MAX = 65535
+    DN_MAX = int(img.max())
+    DN_MIN = max(0, int(img.min()))  # Start histogram from 0 at minimum
     
-    # Create histogram with fixed bins for DN16 range
-    bins = np.linspace(0, DN_MAX + 1, n_bins + 1)
-    hist, edges = np.histogram(img_u16, bins=bins)
+    if DN_MAX <= DN_MIN:
+        return DN_MAX
+    
+    # Create histogram with bins spanning the actual data range
+    bins = np.linspace(DN_MIN, DN_MAX + 1, n_bins + 1)
+    hist, edges = np.histogram(img, bins=bins)
     
     nonzero = hist > 0
     
@@ -203,7 +280,7 @@ def compute_dynamic_threshold(img_u16: np.ndarray,
     return thr
 
 
-def eight_neighbor_mean(raw_u16: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+def eight_neighbor_mean(raw: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
     """
     Compute 8-neighbor mean for hot pixel replacement.
     
@@ -211,7 +288,7 @@ def eight_neighbor_mean(raw_u16: np.ndarray, valid_mask: np.ndarray) -> np.ndarr
     uses only valid (non-hot) neighbors if available, otherwise uses all.
     
     Args:
-        raw_u16: Input uint16 image
+        raw: Input image (int16 or uint16)
         valid_mask: Boolean mask (True = valid pixel, False = hot pixel)
         
     Returns:
@@ -221,7 +298,7 @@ def eight_neighbor_mean(raw_u16: np.ndarray, valid_mask: np.ndarray) -> np.ndarr
         - Uses zero-padding at image boundaries
         - Returns float64 array (should be rounded/clipped before use)
     """
-    img = raw_u16.astype(np.float64)
+    img = raw.astype(np.float64)
     vm = valid_mask.astype(np.float64)
     
     # Pad arrays to handle borders
@@ -265,51 +342,214 @@ def eight_neighbor_mean(raw_u16: np.ndarray, valid_mask: np.ndarray) -> np.ndarr
     return mean
 
 
-def filter_hot_pixels(raw_u16: np.ndarray,
+def filter_hot_pixels(raw: np.ndarray,
                      n_bins: int = 256,
                      factor: float = 1.5,
                      gap_len: int = 2) -> Tuple[np.ndarray, int, int]:
     """
-    Apply hot pixel filtering to raw 16-bit image.
+    Apply hot pixel filtering to raw image.
     
-    This is the main filtering function that:
-    1. Computes dynamic threshold from histogram
-    2. Identifies hot pixels above threshold
-    3. Replaces them with 8-neighbor mean
+    For integer DN data (HRSC): histogram-based dynamic threshold.
+    For float calibrated data (OSIRIS): 5-sigma outlier rejection.
     
     Args:
-        raw_u16: Input uint16 image
-        n_bins: Histogram bins for threshold calculation
-        factor: Threshold multiplier
-        gap_len: Gap detection parameter
+        raw: Input image (int16, uint16, or float32)
+        n_bins: Histogram bins for threshold calculation (int data only)
+        factor: Threshold multiplier (int data only)
+        gap_len: Gap detection parameter (int data only)
         
     Returns:
         Tuple of (filtered_image, threshold_used, num_replaced_pixels)
-        
-    Example:
-        >>> raw = np.array(Image.open("real_raw.tif"), dtype=np.uint16)
-        >>> filtered, thr, n_hot = filter_hot_pixels(raw)
-        >>> print(f"Replaced {n_hot} hot pixels using threshold {thr}")
-        Replaced 342 hot pixels using threshold 58234
     """
+    # ── Float32 path (calibrated radiance, e.g. Rosetta OSIRIS) ──
+    if np.issubdtype(raw.dtype, np.floating):
+        valid = raw[np.isfinite(raw) & (raw > 0)]
+        if valid.size == 0:
+            return raw.copy(), 0.0, 0
+        mu = float(np.mean(valid))
+        sigma = float(np.std(valid))
+        thr = mu + 5.0 * sigma  # 5-sigma outlier
+        hot_mask = (raw > thr) | ~np.isfinite(raw)
+        valid_mask = ~hot_mask
+        nbr_mean = eight_neighbor_mean(raw, valid_mask)
+        filtered = raw.copy()
+        filtered[hot_mask] = nbr_mean[hot_mask].astype(raw.dtype)
+        n_hot = int(hot_mask.sum())
+        print(f"  [FLT] Float hot pixel filter: mu={mu:.6f}, sigma={sigma:.6f}, "
+              f"thr={thr:.6f}, replaced={n_hot}")
+        return filtered, thr, n_hot
+    
+    # ── Integer DN path (HRSC, original behavior) ──
     # Compute dynamic threshold
-    thr = compute_dynamic_threshold(raw_u16, n_bins=n_bins, factor=factor, gap_len=gap_len)
+    thr = compute_dynamic_threshold(raw, n_bins=n_bins, factor=factor, gap_len=gap_len)
     
     # Identify hot pixels
-    hot_mask = raw_u16 > thr
-    valid_mask = raw_u16 <= thr
+    hot_mask = raw > thr
+    valid_mask = raw <= thr
     
     # Compute replacement values using 8-neighbor mean
-    nbr_mean = eight_neighbor_mean(raw_u16, valid_mask)
+    nbr_mean = eight_neighbor_mean(raw, valid_mask)
     
     # Replace hot pixels
-    filtered = raw_u16.copy()
-    filtered_vals = np.rint(nbr_mean[hot_mask]).clip(0, 65535).astype(np.uint16)
+    filtered = raw.copy()
+    dn_min = max(0, int(raw.min()))
+    dn_max = int(raw.max())
+    filtered_vals = np.rint(nbr_mean[hot_mask]).clip(dn_min, dn_max).astype(raw.dtype)
     filtered[hot_mask] = filtered_vals
     
     n_hot = int(hot_mask.sum())
     
     return filtered, thr, n_hot
+
+
+# ============================================================================
+# LOW-DN FILTERING & NaN FILLING
+# ============================================================================
+
+def filter_low_dn(img: np.ndarray, threshold: int = 1) -> np.ndarray:
+    """
+    Mark invalid pixels as NaN.
+    
+    For integer DN data: pixels with DN ≤ threshold → NaN.
+    For float calibrated data: pixels ≤ 0 → NaN (negative radiance = invalid).
+    
+    Args:
+        img: Input image (uint16, int16, or float32)
+        threshold: DN values ≤ this are set to NaN (default: 1, int data only)
+        
+    Returns:
+        float32 array with invalid pixels set to NaN
+    """
+    result = img.astype(np.float32)
+    
+    if np.issubdtype(img.dtype, np.floating):
+        # Float calibrated data: negative/zero radiance → NaN
+        low_mask = result <= 0
+        label = "radiance ≤ 0"
+    else:
+        # Integer DN data (HRSC, original behavior)
+        low_mask = img <= threshold
+        label = f"DN ≤ {threshold}"
+    
+    result[low_mask] = np.nan
+    n_low = int(low_mask.sum())
+    if n_low > 0:
+        print(f"  [FLT] filter_low_dn: {n_low} pixels with {label} -> NaN")
+    return result
+
+
+def fill_nan_cardinal(img: np.ndarray) -> np.ndarray:
+    """
+    Fill NaN pixels using 4-directional (cardinal) nearest-neighbor average.
+    
+    For each NaN pixel, searches left/right/up/down for the nearest
+    non-NaN value in each direction, then replaces the NaN with the
+    average of found neighbors.
+    
+    Args:
+        img: float32 array with NaN values
+        
+    Returns:
+        float32 array with NaN values filled
+        
+    Note:
+        - If no valid neighbor is found in any direction, pixel stays NaN
+        - Uses the original (static) data for lookups, not iteratively filled values
+        - Typical PDS images have very few NaN pixels after DN≤1 filter (~1000)
+          so the loop-based approach is fast enough
+    """
+    original = img  # Static reference for lookups (never modified)
+    filled = img.copy()  # Output array (modified in-place)
+    nan_mask = np.isnan(original)
+    n_nan = int(nan_mask.sum())
+    
+    if n_nan == 0:
+        return filled
+    
+    nan_indices = np.argwhere(nan_mask)
+    filled_count = 0
+    
+    for r, c in nan_indices:
+        neighbors = []
+        
+        # Search LEFT (same row, decreasing column)
+        if c > 0:
+            left_seg = original[r, :c][::-1]
+            valid_idx = np.where(~np.isnan(left_seg))[0]
+            if valid_idx.size > 0:
+                neighbors.append(float(left_seg[valid_idx[0]]))
+        
+        # Search RIGHT (same row, increasing column)
+        if c < original.shape[1] - 1:
+            right_seg = original[r, c+1:]
+            valid_idx = np.where(~np.isnan(right_seg))[0]
+            if valid_idx.size > 0:
+                neighbors.append(float(right_seg[valid_idx[0]]))
+        
+        # Search UP (same column, decreasing row)
+        if r > 0:
+            up_seg = original[:r, c][::-1]
+            valid_idx = np.where(~np.isnan(up_seg))[0]
+            if valid_idx.size > 0:
+                neighbors.append(float(up_seg[valid_idx[0]]))
+        
+        # Search DOWN (same column, increasing row)
+        if r < original.shape[0] - 1:
+            down_seg = original[r+1:, c]
+            valid_idx = np.where(~np.isnan(down_seg))[0]
+            if valid_idx.size > 0:
+                neighbors.append(float(down_seg[valid_idx[0]]))
+        
+        if neighbors:
+            filled[r, c] = np.mean(neighbors)
+            filled_count += 1
+    
+    remaining = int(np.isnan(filled).sum())
+    print(f"  🔧 fill_nan_cardinal: filled {filled_count}/{n_nan} NaN pixels"
+          f"{f', {remaining} remaining' if remaining > 0 else ''}")
+    
+    return filled
+
+
+def preclip_percentile(img: np.ndarray,
+                       low_p: float = 1.0,
+                       high_p: float = 99.0) -> np.ndarray:
+    """
+    Clip outlier values using percentiles and normalize to [0, 1].
+    
+    Computes the low_p-th and high_p-th percentiles from valid (non-NaN)
+    pixels, clips to that range, then linearly maps to [0, 1].
+    NaN values are preserved.
+    
+    Args:
+        img: float32 array (may contain NaN)
+        low_p: Lower percentile for clipping (default: 2.0)
+        high_p: Upper percentile for clipping (default: 98.0)
+        
+    Returns:
+        float32 array in [0, 1] with NaN preserved
+    """
+    valid_mask = np.isfinite(img)
+    valid_values = img[valid_mask]
+    
+    if valid_values.size == 0:
+        return img.copy()
+    
+    p_low, p_high = np.percentile(valid_values, [low_p, high_p])
+    
+    if p_high <= p_low:
+        print(f"  ⚠️ preclip_percentile: P{low_p}={p_low:.1f} >= P{high_p}={p_high:.1f}, skipping")
+        return img.copy()
+    
+    result = img.copy()
+    # Clip valid values to [p_low, p_high]
+    result[valid_mask] = np.clip(valid_values, p_low, p_high)
+    # Normalize to [0, 1]
+    result[valid_mask] = (result[valid_mask] - p_low) / (p_high - p_low)
+    
+    print(f"  🔧 preclip_percentile: P{low_p}={p_low:.1f}, P{high_p}={p_high:.1f} → [0, 1]")
+    
+    return result
 
 
 # ============================================================================

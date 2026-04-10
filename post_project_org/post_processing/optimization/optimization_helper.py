@@ -31,14 +31,77 @@ render_synthetic_for_params = None
 # ============================================================================
 # LIGHTWEIGHT METRIC STASH (for per-eval logging)
 # ============================================================================
-_LAST_EVAL_METRICS = {"nmrse": float("nan"), "ssim": float("nan")}
+_LAST_EVAL_METRICS: dict = {
+    "nmrse": float("nan"), "ssim": float("nan"),
+    "ms_ssim": float("nan"), "gmsd": float("nan"),
+    "hist_corr": float("nan"), "orb_penalty": 0.0,
+    "ncc": float("nan"), "lpips": float("nan")
+}
 
-def set_last_eval_metrics(nmrse: float, ssim: float):
+def set_last_eval_metrics(nmrse: float, ssim: float,
+                          ms_ssim: float = float("nan"),
+                          gmsd: float = float("nan"),
+                          hist_corr: float = float("nan"),
+                          orb_penalty: float = 0.0,
+                          ncc: float = float("nan"),
+                          lpips: float = float("nan")):
     _LAST_EVAL_METRICS["nmrse"] = float(nmrse)
     _LAST_EVAL_METRICS["ssim"] = float(ssim)
+    _LAST_EVAL_METRICS["ms_ssim"] = float(ms_ssim)
+    _LAST_EVAL_METRICS["gmsd"] = float(gmsd)
+    _LAST_EVAL_METRICS["hist_corr"] = float(hist_corr)
+    _LAST_EVAL_METRICS["orb_penalty"] = float(orb_penalty)
+    _LAST_EVAL_METRICS["ncc"] = float(ncc)
+    _LAST_EVAL_METRICS["lpips"] = float(lpips)
 
 def get_last_eval_metrics():
     return dict(_LAST_EVAL_METRICS)
+
+# ============================================================================
+# ADAPTIVE CROP STATE - İlk N iterasyonda bbox öğren, sonra kilitle
+# Per-image: her IMG kendi bbox geçmişine ve kilitli bbox'ına sahiptir.
+# ============================================================================
+_ADAPTIVE_CROP_STATE = {
+    'per_image': {},        # {img_stem: {'history': [], 'locked_bbox': None}}
+    'eval_count': 0,        # Toplam eval sayacı (warmup N'i için)
+    'n': 0,                 # Kaç iterasyondan sonra kilitlenecek (0=devre dışı)
+    'warmup_complete': False  # Warmup tamamlandı mı?
+}
+
+def _find_median_bbox(history):
+    """Bbox geçmişinden median koordinatlar hesapla."""
+    if not history:
+        return None
+    y0s = [b[0] for b in history]
+    y1s = [b[1] for b in history]
+    x0s = [b[2] for b in history]
+    x1s = [b[3] for b in history]
+    return (
+        int(np.median(y0s)),
+        int(np.median(y1s)),
+        int(np.median(x0s)),
+        int(np.median(x1s))
+    )
+
+def reset_adaptive_crop_state(n: int = 0):
+    """Adaptive crop state'i sıfırla."""
+    global _ADAPTIVE_CROP_STATE
+    _ADAPTIVE_CROP_STATE = {
+        'per_image': {},
+        'eval_count': 0,
+        'n': n,
+        'warmup_complete': False
+    }
+
+def get_adaptive_crop_state():
+    """Mevcut adaptive crop state'ini döndür."""
+    return dict(_ADAPTIVE_CROP_STATE)
+
+def is_in_warmup() -> bool:
+    """Warmup döneminde miyiz? (bbox henüz kilitlenmemiş)"""
+    if _ADAPTIVE_CROP_STATE['n'] == 0:
+        return False  # Adaptive crop devre dışı
+    return not _ADAPTIVE_CROP_STATE['warmup_complete']
 
 # ============================================================================
 # PARAMETER DEFINITIONS
@@ -53,12 +116,76 @@ PARAMETER_BOUNDS = {
     'ior': (1.33, 1.79),
     'q_eff': (0.7, 1.4),
     'threshold_value': (0.0, 0.1),
-    'mars_rough': (0.0, 1.0),
-    'mars_albedo_mul': (0.0, 2.0),
+    'mars_base_gray': (0.02, 0.60),
+    'mars_tex_mix': (0.0, 1.0),
+    'mars_oren_rough': (0.0, 1.0),
+    'mars_princ_rough': (0.0, 1.0),
+    'mars_shader_mix': (0.0, 1.0),
+    'mars_ior': (0.5, 5.0),
+    'mars_albedo_mul': (0.2, 5.0),
+    # Atmosphere parameters
+    'atm_beta0': (1e-8, 1e-2),
+    'atm_scale_height': (0.0, 120.0),   
+    'atm_anisotropy': (-1.0, 1.0),
+    'atm_color_r': (0.3, 1.0),
+    'atm_color_g': (0.2, 0.8),
+    'atm_color_b': (0.1, 0.6),
 }
 
 PARAMETER_NAMES = list(PARAMETER_BOUNDS.keys())
 N_PARAMS = len(PARAMETER_NAMES)
+
+
+# ============================================================================
+# FIXED-VARIABLE MECHANISM
+# ============================================================================
+
+# Parameters in this dict are fixed at the given values and excluded from
+# the optimizer search space.  Set via set_fixed_params().
+FIXED_PARAMS: Dict[str, float] = {}
+
+
+def set_fixed_params(fixed: Dict[str, float]):
+    """Fix specific params at given values — they won't be optimized.
+
+    Example:
+        set_fixed_params({'atm_beta0': 3e-4, 'atm_scale_height': 11.0})
+    """
+    global FIXED_PARAMS
+    FIXED_PARAMS = dict(fixed)
+    print(f"  🔒 Fixed params ({len(FIXED_PARAMS)}): {FIXED_PARAMS}")
+
+
+def get_active_bounds() -> Dict[str, tuple]:
+    """Return bounds only for non-fixed (optimized) params."""
+    return {k: v for k, v in PARAMETER_BOUNDS.items() if k not in FIXED_PARAMS}
+
+
+def get_active_names() -> List[str]:
+    """Return names of optimized (non-fixed) params."""
+    return [k for k in PARAMETER_NAMES if k not in FIXED_PARAMS]
+
+
+def get_active_n_params() -> int:
+    """Return number of optimized (non-fixed) params."""
+    return len(get_active_names())
+
+
+def active_to_full(active_array: np.ndarray) -> np.ndarray:
+    """Map reduced-dimension optimizer vector back to full param array.
+
+    Fixed values are injected at their canonical positions.
+    """
+    full = np.zeros(N_PARAMS)
+    active_names = get_active_names()
+    active_idx = 0
+    for i, name in enumerate(PARAMETER_NAMES):
+        if name in FIXED_PARAMS:
+            full[i] = FIXED_PARAMS[name]
+        else:
+            full[i] = active_array[active_idx]
+            active_idx += 1
+    return full
 
 
 # ============================================================================
@@ -85,24 +212,46 @@ def clip_params(params: np.ndarray) -> np.ndarray:
 
 
 def get_bounds_arrays() -> Tuple[np.ndarray, np.ndarray]:
-    """Get lower and upper bounds as arrays."""
+    """Get lower and upper bounds as arrays (active params only)."""
+    active = get_active_bounds()
+    lower = np.array([v[0] for v in active.values()])
+    upper = np.array([v[1] for v in active.values()])
+    return lower, upper
+
+
+def get_full_bounds_arrays() -> Tuple[np.ndarray, np.ndarray]:
+    """Get lower and upper bounds for ALL params (including fixed)."""
     lower = np.array([PARAMETER_BOUNDS[name][0] for name in PARAMETER_NAMES])
     upper = np.array([PARAMETER_BOUNDS[name][1] for name in PARAMETER_NAMES])
     return lower, upper
 
 
 def random_params(n_samples: int = 1, seed: Optional[int] = None) -> np.ndarray:
-    """Generate random parameter sets within bounds."""
+    """Generate random parameter sets within bounds (active params only)."""
     if seed is not None:
         np.random.seed(seed)
     
     lower, upper = get_bounds_arrays()
-    return np.random.uniform(lower, upper, size=(n_samples, N_PARAMS))
+    n_active = get_active_n_params()
+    return np.random.uniform(lower, upper, size=(n_samples, n_active))
 
 
 def print_params_table(params: np.ndarray):
-    """Print parameters in a formatted table."""
-    params_dict = params_to_dict(params)
+    """Print parameters in a formatted table.
+    
+    Accepts either active-dim or full-dim arrays.
+    Fixed params are marked with 🔒.
+    """
+    if params is None:
+        print("\n  ⚠️ No valid parameters found (all iterations were warmup?)\n")
+        return
+    n_active = get_active_n_params()
+    if len(params) == n_active and n_active < N_PARAMS:
+        full_params = active_to_full(params)
+    else:
+        full_params = params
+    
+    params_dict = params_to_dict(full_params)
     
     print("\n" + "="*60)
     print("Parameter Values")
@@ -113,7 +262,8 @@ def print_params_table(params: np.ndarray):
     for name in PARAMETER_NAMES:
         val = params_dict[name]
         lower, upper = PARAMETER_BOUNDS[name]
-        print(f"{name:<20} {val:>15.6f} [{lower:.2f}, {upper:.2f}]")
+        marker = " 🔒" if name in FIXED_PARAMS else ""
+        print(f"{name:<20} {val:>15.6f} [{lower:.2f}, {upper:.2f}]{marker}")
     
     print("="*60 + "\n")
 
@@ -135,7 +285,15 @@ def evaluate_params_with_rendering(params,
                                    learned_k_db: Optional[Dict[str, int]] = None,
                                    # YENİ: Blender kalıcılık/batch
                                    blender_persistent: bool = True,
-                                   blender_batch_size: Optional[int] = None):
+                                   blender_batch_size: Optional[int] = None,
+                                   # YENİ: Adaptive crop
+                                   adaptive_crop_n: int = 0,
+                                   # YENİ: Atmosphere & Displacement
+                                   use_displacement: bool = True,
+                                   use_atmosphere: bool = True,
+                                   atm_color_mode: str = 'single',
+                                   dem_path: Optional[str] = None,
+                                   fixed_k: Optional[int] = None):
     """
     Evaluate parameters by:
     1. Rendering synthetic images with CORTO
@@ -162,7 +320,7 @@ def evaluate_params_with_rendering(params,
     import shutil
     import json
     from pathlib import Path
-    from pds_processor import load_pds_image_data, filter_hot_pixels
+    from pds_processor import load_pds_image_data, filter_hot_pixels, filter_low_dn, fill_nan_cardinal, preclip_percentile
     from metrics_evaluator import normalize_image, compute_metrics, evaluate_k
     from quick_evaluator import extract_pds_clip_params
     # ==========================================
@@ -201,7 +359,12 @@ def evaluate_params_with_rendering(params,
             particle_id=particle_id,
             # YENİ: kalıcılık/batch parametreleri aşağıya iletiliyor
             persistent=blender_persistent,
-            batch_size=blender_batch_size
+            batch_size=blender_batch_size,
+            # YENİ: Atmosphere & Displacement
+            use_displacement=use_displacement,
+            use_atmosphere=use_atmosphere,
+            atm_color_mode=atm_color_mode,
+            dem_path=dem_path
         )
         
         if None in synthetic_files:
@@ -209,19 +372,21 @@ def evaluate_params_with_rendering(params,
             return np.inf
         
         # ============ CLIP SYNTHETIC TO PDS DIMENSIONS ============
+        # Her görüntü için kendi PDS clip parametreleri kullanılır.
         if 'pds_path' in img_info_list[0]:
             if verbose:
                 print(f"\nClipping synthetic images to PDS dimensions...")
             
-            pds_params = extract_pds_clip_params(Path(img_info_list[0]['pds_path']))
-            
-            if verbose:
-                print(f"  PDS Clip Parameters:")
-                print(f"    col_off={pds_params['col_off']}, row_off={pds_params['row_off']}")
-                print(f"    width={pds_params['width']}, height={pds_params['height']}")
-            
             clipped_files = []
-            for synth_file in synthetic_files:
+            for synth_file, img_info_clip in zip(synthetic_files, img_info_list):
+                # Her görüntü için kendi PDS clip parametreleri
+                pds_params = extract_pds_clip_params(Path(img_info_clip['pds_path']))
+                
+                if verbose:
+                    print(f"  PDS Clip [{img_info_clip['filename']}]:")
+                    print(f"    col_off={pds_params['col_off']}, row_off={pds_params['row_off']}")
+                    print(f"    width={pds_params['width']}, height={pds_params['height']}")
+                
                 # Load as uint16 PNG (Blender output)
                 synth_img = np.array(Image.open(synth_file))
                 
@@ -288,6 +453,7 @@ def evaluate_params_with_rendering(params,
         # EVALUATE each pair
         objectives = []
         results_list = []  # Store results for later inspection
+        is_warmup_iteration = False  # Warmup flag — döngü sonunda kontrol edilecek
         
         for i, (img_info, synthetic_file) in enumerate(zip(img_info_list, synthetic_files)):
             if verbose:
@@ -295,18 +461,61 @@ def evaluate_params_with_rendering(params,
                 print(f"  Real: {img_info['filename']}")
                 print(f"  Synthetic: {synthetic_file.name}")
             
-            # --- YENİ: metrics_evaluator.evaluate_k kullan ---
-            # Real (filtered) ve synthetic (float32 [0,1]) burada dosyadan okunarak
-            # evaluate_k içinde normalize/align/crop yapılır.
-            # Not: quick_evaluate yerine in-RAM learned_k_db ile hızlanır.
+            # --- metrics_evaluator.evaluate_k kullan ---
             # Real görüntüyü oku ve hot-pixel filtresi uygula
             raw_img, _ = load_pds_image_data(Path(img_info['pds_path']))
             filtered_img, _, _ = filter_hot_pixels(raw_img)
+            # DN ≤ 1 → NaN (dead pixels)
+            filtered_img = filter_low_dn(filtered_img, threshold=1)
+            # P1-P99 clip + [0,1] normalize (NaN korunur)
+            filtered_img = preclip_percentile(filtered_img, low_p=1.0, high_p=99.0)
+            # 4-yönlü NaN doldurma ([0,1] data üzerinde)
+            filtered_img = fill_nan_cardinal(filtered_img)
+            
+            # NOTE: real image from load_pds_image_data is already LINES×LINE_SAMPLES.
+            # LINE_FIRST_PIXEL/SAMPLE_FIRST_PIXEL are sensor frame offsets, not within-data offsets.
+            # Synthetic is also clipped to same PDS dimensions earlier (line 387-393).
+            # Both images should be the same shape here — no additional clipping needed.
+            
+            # Save filled version for visual inspection
+            _filled_path = synthetic_file.parent / f"{Path(img_info['filename']).stem}_real_filled.tif"
+            try:
+                from PIL import Image as _PILImage
+                # filtered_img is float32 [0,1] — save as 32-bit TIFF
+                _PILImage.fromarray(filtered_img, mode='F').save(str(_filled_path))
+                print(f"  💾 Saved filled real image: {_filled_path.name}")
+            except Exception as _e:
+                print(f"  ⚠️ Could not save filled image: {_e}")
             # Synthetic'i float32 olarak yükle (zaten [0,1] kaydedildi)
             synth_img = np.array(Image.open(synthetic_file), dtype=np.float32)
             synth_img = np.clip(synth_img, 0.0, 1.0)
 
             img_stem = Path(img_info['filename']).stem
+            
+            # ============ ADAPTIVE CROP LOGIC (PER-IMAGE) ============
+            global _ADAPTIVE_CROP_STATE
+            fixed_bbox = None
+            
+            # Fixed K value (passed as argument)
+            fixed_k_val = fixed_k
+            
+            # Adaptive crop aktifse ve mode='cropped' ise
+            if adaptive_crop_n > 0 and mode == 'cropped':
+                # State'i başlat (ilk kez çağrılıyorsa)
+                if _ADAPTIVE_CROP_STATE['n'] == 0:
+                    _ADAPTIVE_CROP_STATE['n'] = adaptive_crop_n
+                
+                # Per-image state al veya oluştur
+                img_crop_state = _ADAPTIVE_CROP_STATE['per_image'].setdefault(
+                    img_stem, {'history': [], 'locked_bbox': None}
+                )
+                
+                # Bu IMG'nin kilitli bbox'ı varsa kullan
+                if img_crop_state['locked_bbox'] is not None:
+                    fixed_bbox = img_crop_state['locked_bbox']
+                    if verbose or _ADAPTIVE_CROP_STATE['eval_count'] == adaptive_crop_n:
+                        print(f"  🔒 Using locked bbox for {img_stem}: {fixed_bbox}")
+            
             eval_res = evaluate_k(
                 real_raw=filtered_img,
                 synthetic_norm=synth_img,
@@ -315,8 +524,61 @@ def evaluate_params_with_rendering(params,
                 buffer_percent=5.0,
                 verbose=verbose,
                 k_mode=k_mode,
-                learned_k_db=learned_k_db
+                learned_k_db=learned_k_db,
+                fixed_bbox=fixed_bbox,           # Bu IMG'ye özgü kilitli bbox
+                fixed_k=fixed_k_val,             # Manuel k değeri
+                objective_type=objective_type,    # Objective-aware k seçimi
             )
+            
+            # Bbox'ı kaydet (henüz kilitlenmemişse) — PER-IMAGE
+            if adaptive_crop_n > 0 and mode == 'cropped' and not _ADAPTIVE_CROP_STATE['warmup_complete']:
+                img_crop_state = _ADAPTIVE_CROP_STATE['per_image'].setdefault(
+                    img_stem, {'history': [], 'locked_bbox': None}
+                )
+                # eval_res'ten bbox al (cropped modda döner)
+                if 'crop_bbox' in eval_res and eval_res['crop_bbox'] is not None:
+                    bbox = eval_res['crop_bbox']
+                    bbox_h = bbox[1] - bbox[0]  # y1 - y0
+                    bbox_w = bbox[3] - bbox[2]  # x1 - x0
+                    if bbox_h >= 100 and bbox_w >= 100:
+                        img_crop_state['history'].append(bbox)
+                        print(f"  🔄 WARMUP [{img_stem}]: Learning bbox {bbox} (sample #{len(img_crop_state['history'])})")
+                    else:
+                        print(f"  ⚠️ WARMUP [{img_stem}]: Skipping garbage bbox {bbox} ({bbox_h}×{bbox_w} px)")
+                
+                # Eval count'u sadece son görüntüde artır (her tam döngü = 1 eval)
+                if i == len(img_info_list) - 1:
+                    _ADAPTIVE_CROP_STATE['eval_count'] += 1
+                    print(f"  🔄 WARMUP eval {_ADAPTIVE_CROP_STATE['eval_count']}/{adaptive_crop_n}")
+                    
+                    # N'e ulaştıysak kilitle — tüm IMG'ler için
+                    if _ADAPTIVE_CROP_STATE['eval_count'] >= adaptive_crop_n:
+                        for stem, state in _ADAPTIVE_CROP_STATE['per_image'].items():
+                            if len(state['history']) > 0:
+                                state['locked_bbox'] = _find_median_bbox(state['history'])
+                                print(f"  🔒 Bbox locked for {stem}: {state['locked_bbox']} (from {len(state['history'])} samples)")
+                            else:
+                                # All warmup bboxes were garbage — use None (no fixed bbox, center-crop fallback in evaluator)
+                                state['locked_bbox'] = None
+                                print(f"  ⚠️ No valid warmup bboxes for {stem} — will use dynamic crop with center fallback")
+                        _ADAPTIVE_CROP_STATE['warmup_complete'] = True
+                        
+                        # Tüm IMG'ler için learned K finalize
+                        if learned_k_db is not None:
+                            from metrics_evaluator import finalize_learned_k
+                            for info in img_info_list:
+                                stem = Path(info['filename']).stem
+                                finalize_learned_k(stem, learned_k_db)
+                                print(f"  🧠 Learned k finalized for {stem}: {learned_k_db.get(stem, 'Not found')}")
+
+                        print(f"\n  🔒 WARMUP COMPLETE!")
+                        print(f"     ⚠️ Warmup scores will NOT be used for optimization!\n")
+                
+                # Warmup döneminde bu IMG'nin objective'ini sayma
+                is_warmup_iteration = True
+                continue  # Diğer görüntülere devam et
+            # =============================================
+            
             results_list.append(eval_res)  # Save for inspection
 
             # Calculate objective
@@ -330,13 +592,44 @@ def evaluate_params_with_rendering(params,
                 ssim_best = float(eval_res['best_ssim_score'])
                 rmse_best = float(eval_res['best_rmse_score'])
                 obj_val = (1.0 - ssim_best) + rmse_best*(1/3) #weigh is 1/3 for rmse
+            elif objective_type == 'combined-new':
+                ms_ssim_best  = float(eval_res.get('best_ms_ssim', 0.0))
+                rmse_best     = float(eval_res['best_rmse_score'])
+                gmsd_best     = float(eval_res.get('best_gmsd', 0.15))
+                ncc_best      = float(eval_res.get('best_ncc', 0.0))
+                lpips_best    = float(eval_res.get('best_lpips', 0.5))
+                # Weights:
+                #   MS-SSIM: multi-scale structural (1.0)
+                #   NMRSE:   pixel-level diff       (0.33)
+                #   GMSD:    gradient texture        (0.33)
+                #   NCC:     pattern (brightness-invariant) (-0.10 because higher=better)
+                #   LPIPS:   perceptual              (+0.10 because lower=better)
+                ncc_contrib  = 0.0 if not np.isfinite(ncc_best)  else -0.30 * ncc_best
+                lpips_contrib = 0.0 if not np.isfinite(lpips_best) else  0.5 * lpips_best
+                obj_val = ((1.0 - ms_ssim_best)
+                           + rmse_best * (1/3)
+                           + gmsd_best * (1/3)
+                           + ncc_contrib
+                           + lpips_contrib)
             else:
                 raise ValueError(f"Unknown objective: {objective_type}")
+            
+            # ---- ORB PENALTY (tiered) ----
+            orb_penalty = eval_res.get('orb_penalty', 0.0)
+            if orb_penalty > 0:
+                obj_val += orb_penalty
+                print(f"  🚫 ORB penalty +{orb_penalty:.1f}: obj {obj_val - orb_penalty:.4f} → {obj_val:.4f}")
             
             objectives.append(obj_val)
             
             if verbose:
                 print(f"  Objective: {obj_val:.6f}")
+        
+        # ============ WARMUP CHECK ============
+        # Warmup döneminde tüm görüntüler değerlendirildi ama skorlar kullanılmayacak
+        if is_warmup_iteration:
+            return float('inf')
+        # =======================================
         
         # AGGREGATE
         objectives = np.array(objectives)
@@ -347,6 +640,11 @@ def evaluate_params_with_rendering(params,
             final_obj = float(np.median(objectives))
         elif aggregation == 'max':
             final_obj = float(np.max(objectives))
+        elif aggregation == 'rss':
+            # Root-sum-of-squares: sqrt(sum(obj_i^2))
+            # 1 image: sqrt(x^2) = x  (identical to mean)
+            # N images: L2-norm, larger errors penalized more than mean
+            final_obj = float(np.sqrt(np.sum(objectives ** 2)))
         else:
             raise ValueError(f"Unknown aggregation: {aggregation}")
         
@@ -362,7 +660,34 @@ def evaluate_params_with_rendering(params,
             ssim_mean  = float(np.nanmean(np.array(ssim_vals))) if len(ssim_vals) else float('nan')
             nmrse_mean = float(np.nanmean(np.array(rmse_vals))) if len(rmse_vals) else float('nan')
 
-            set_last_eval_metrics(nmrse=nmrse_mean, ssim=ssim_mean)
+            # Additional metrics
+            ms_ssim_vals = [float(r.get('best_ms_ssim', np.nan)) for r in results_list]
+            gmsd_vals = [float(r.get('best_gmsd', np.nan)) for r in results_list]
+            # hist_corr: from all_results[0] if available
+            hist_corr_vals = []
+            for r in results_list:
+                ar = r.get('all_results', [])
+                if ar and 'hist_corr' in ar[0]:
+                    hist_corr_vals.append(float(ar[0]['hist_corr']))
+                else:
+                    hist_corr_vals.append(float('nan'))
+            ncc_vals  = [float(r.get('best_ncc',   np.nan)) for r in results_list]
+            lpips_vals = [float(r.get('best_lpips', np.nan)) for r in results_list]
+            orb_penalty_vals = [float(r.get('orb_penalty', 0.0)) for r in results_list]
+
+            ms_ssim_mean  = float(np.nanmean(np.array(ms_ssim_vals)))  if len(ms_ssim_vals)  else float('nan')
+            gmsd_mean     = float(np.nanmean(np.array(gmsd_vals)))     if len(gmsd_vals)     else float('nan')
+            hist_corr_mean = float(np.nanmean(np.array(hist_corr_vals))) if len(hist_corr_vals) else float('nan')
+            ncc_mean      = float(np.nanmean(np.array(ncc_vals)))      if len(ncc_vals)      else float('nan')
+            lpips_mean    = float(np.nanmean(np.array(lpips_vals)))    if len(lpips_vals)    else float('nan')
+            orb_penalty_mean = float(np.mean(orb_penalty_vals)) if len(orb_penalty_vals) else 0.0
+
+            set_last_eval_metrics(
+                nmrse=nmrse_mean, ssim=ssim_mean,
+                ms_ssim=ms_ssim_mean, gmsd=gmsd_mean,
+                hist_corr=hist_corr_mean, orb_penalty=orb_penalty_mean,
+                ncc=ncc_mean, lpips=lpips_mean
+            )
         except Exception:
             # Logging hiçbir zaman objective akışını bozmasın
             pass        
@@ -382,21 +707,12 @@ def evaluate_params_with_rendering(params,
                 
                 img_stem = Path(img_info['filename']).stem
                 
-                # ===== RELOAD SYNTHETIC AND CLIP TO PDS DIMENSIONS =====
+                # ===== RELOAD SYNTHETIC (already PDS-clipped) =====
                 try:
-                    # Load synthetic (already normalized [0,1])
-                    synth_raw = np.array(Image.open(synthetic_file), dtype=np.float32)
-                    synth_raw = np.clip(synth_raw, 0.0, 1.0)
-                    
-                    # Clip to PDS dimensions
-                    if 'pds_path' in img_info:
-                        pds_params = extract_pds_clip_params(Path(img_info['pds_path']))
-                        synth_clipped = synth_raw[
-                            pds_params['row_off']:pds_params['row_off']+pds_params['height'],
-                            pds_params['col_off']:pds_params['col_off']+pds_params['width']
-                        ]
-                    else:
-                        synth_clipped = synth_raw
+                    # synthetic_file IS _clipped.tiff (PDS clip already applied at line 387-393)
+                    # NO second clip needed — loading as-is
+                    synth_clipped = np.array(Image.open(synthetic_file), dtype=np.float32)
+                    synth_clipped = np.clip(synth_clipped, 0.0, 1.0)
                     
                     print(f"  Synthetic clipped shape: {synth_clipped.shape}")
                     
@@ -408,54 +724,75 @@ def evaluate_params_with_rendering(params,
                 best_ssim_k = result_dict.get('best_ssim_k')
                 if best_ssim_k is not None:
                     try:
-                        # Load and normalize real at best SSIM k
-                        raw_img, _ = load_pds_image_data(Path(img_info['pds_path']))
-                        filtered_img, _, _ = filter_hot_pixels(raw_img)
-                        real_norm_ssim = normalize_image(filtered_img, low_p=float(best_ssim_k), high_p=100.0)
+                        # Use pre-aligned images from evaluate_k (same alignment as SSIM computation)
+                        aligned_real = result_dict.get('aligned_real')
+                        aligned_synth = result_dict.get('aligned_synth')
                         
-                        # Clip to PDS dimensions
-                        if 'pds_path' in img_info:
-                            real_norm_ssim = real_norm_ssim[
-                                pds_params['row_off']:pds_params['row_off']+pds_params['height'],
-                                pds_params['col_off']:pds_params['col_off']+pds_params['width']
-                            ]
-                        
-                        print(f"  Real (k={best_ssim_k}) clipped shape: {real_norm_ssim.shape}")
-                        
-                        # Check shape compatibility
-                        if real_norm_ssim.shape != synth_clipped.shape:
-                            print(f"  ⚠️ Shape mismatch: real {real_norm_ssim.shape} vs synth {synth_clipped.shape}")
-                            continue
-                        
-                        # Apply ALIGNMENT & CROPPING if in cropped mode
-                        if mode == "cropped":
-                            alignment_result = align_and_crop_with_buffer(
-                                imgA=real_norm_ssim,
-                                imgB=synth_clipped,
-                                buffer_ratio=0.05,            # ← A patch’i ile artık geçerli
-                                upsample_factor=100,
-                                interpolation_order=1
-                            )
-                            real_norm_ssim = alignment_result['A_crop']
-                            synth_for_ssim = alignment_result['B_crop']
+                        if aligned_real is not None and aligned_synth is not None:
+                            real_norm_ssim = aligned_real
+                            synth_for_ssim = aligned_synth
                             
                             # Save alignment info
-                            alignment_info = {
-                                'k': int(best_ssim_k),
-                                'metric': 'SSIM',
-                                'shift_dy': float(alignment_result['shift'][0]),
-                                'shift_dx': float(alignment_result['shift'][1]),
-                                'bbox': [int(x) for x in alignment_result['bbox']],
-                                'cropped_shape': list(real_norm_ssim.shape)
-                            }
-                            
-                            alignment_path = inspection_dir / f"{img_stem}_alignment_k{best_ssim_k:02d}_bestSSIM.json"
-                            with open(alignment_path, 'w') as f:
-                                json.dump(alignment_info, f, indent=2)
-                            
-                            print(f"  ✅ Saved alignment info: {alignment_path.name}")
+                            if mode == "cropped":
+                                a_shift = result_dict.get('alignment_shift')
+                                a_bbox = result_dict.get('crop_bbox')
+                                alignment_info = {
+                                    'k': int(best_ssim_k),
+                                    'metric': 'SSIM',
+                                    'shift_dy': float(a_shift[0]) if a_shift is not None else 0.0,
+                                    'shift_dx': float(a_shift[1]) if a_shift is not None else 0.0,
+                                    'bbox': [int(x) for x in a_bbox] if a_bbox is not None else None,
+                                    'cropped_shape': list(real_norm_ssim.shape),
+                                    'alignment_method': result_dict.get('alignment_method', 'unknown'),
+                                    'note': 'Same alignment used for SSIM computation'
+                                }
+                                
+                                alignment_path = inspection_dir / f"{img_stem}_alignment_k{best_ssim_k:02d}_bestSSIM.json"
+                                with open(alignment_path, 'w') as f:
+                                    json.dump(alignment_info, f, indent=2)
+                                
+                                print(f"  ✅ Saved alignment info: {alignment_path.name}")
                         else:
-                            synth_for_ssim = synth_clipped
+                            # Fallback: re-load and re-align (legacy path for sweep mode)
+                            raw_img, _ = load_pds_image_data(Path(img_info['pds_path']))
+                            filtered_img, _, _ = filter_hot_pixels(raw_img)
+                            filtered_img = filter_low_dn(filtered_img, threshold=1)
+                            filtered_img = preclip_percentile(filtered_img, low_p=1.0, high_p=99.0)
+                            real_norm_ssim = fill_nan_cardinal(filtered_img)
+                            
+                            # NOTE: load_pds_image_data already returns LINES×LINE_SAMPLES.
+                            # No additional PDS offset clipping needed.
+                            
+                            print(f"  Real (k={best_ssim_k}) clipped shape: {real_norm_ssim.shape}")
+                            
+                            if mode == "cropped":
+                                alignment_result = align_and_crop_with_buffer(
+                                    imgA=real_norm_ssim,
+                                    imgB=synth_clipped,
+                                    buffer_ratio=0.05,
+                                    upsample_factor=100,
+                                    interpolation_order=1
+                                )
+                                real_norm_ssim = alignment_result['A_crop']
+                                synth_for_ssim = alignment_result['B_crop']
+                                
+                                alignment_info = {
+                                    'k': int(best_ssim_k),
+                                    'metric': 'SSIM',
+                                    'shift_dy': float(alignment_result['shift'][0]),
+                                    'shift_dx': float(alignment_result['shift'][1]),
+                                    'bbox': [int(x) for x in alignment_result['bbox']],
+                                    'cropped_shape': list(real_norm_ssim.shape),
+                                    'note': 'Re-aligned (fallback path)'
+                                }
+                                
+                                alignment_path = inspection_dir / f"{img_stem}_alignment_k{best_ssim_k:02d}_bestSSIM.json"
+                                with open(alignment_path, 'w') as f:
+                                    json.dump(alignment_info, f, indent=2)
+                                
+                                print(f"  ✅ Saved alignment info: {alignment_path.name}")
+                            else:
+                                synth_for_ssim = synth_clipped
                         
                         # Save CLIPPED+(ALIGNED+CROPPED) real
                         real_ssim_path = inspection_dir / f"{img_stem}_real_norm_k{best_ssim_k:02d}_bestSSIM_{mode}.tif"
@@ -468,7 +805,7 @@ def evaluate_params_with_rendering(params,
                         print(f"  ✅ Saved best SSIM pair (k={best_ssim_k}, mode={mode}):")
                         print(f"     Real: {real_ssim_path.name} (shape: {real_norm_ssim.shape})")
                         print(f"     Synth: {synth_ssim_path.name} (shape: {synth_for_ssim.shape})")
-                        if mode == "cropped":
+                        if mode == "cropped" and 'alignment_info' in dir():
                             print(f"     Shift: dy={alignment_info['shift_dy']:.2f}, dx={alignment_info['shift_dx']:.2f}")
                             
                     except Exception as e:
@@ -480,10 +817,12 @@ def evaluate_params_with_rendering(params,
                 best_rmse_k = result_dict.get('best_rmse_k')
                 if best_rmse_k is not None and best_rmse_k != best_ssim_k:
                     try:
-                        # Load and normalize real at best RMSE k
+                        # Load and process real image with Colab pipeline
                         raw_img, _ = load_pds_image_data(Path(img_info['pds_path']))
                         filtered_img, _, _ = filter_hot_pixels(raw_img)
-                        real_norm_rmse = normalize_image(filtered_img, low_p=float(best_rmse_k), high_p=100.0)
+                        filtered_img = filter_low_dn(filtered_img, threshold=1)
+                        filtered_img = preclip_percentile(filtered_img, low_p=1.0, high_p=99.0)
+                        real_norm_rmse = fill_nan_cardinal(filtered_img)
                         
                         # Clip to PDS dimensions
                         if 'pds_path' in img_info:
@@ -612,17 +951,19 @@ def evaluate_params_with_rendering(params,
 def with_eval_logging(objective_fn: Callable,
                       pop_size: int,
                       img_info_list: list,
-                      csv_dir: Optional[Union[Path, str]] = None):
+                      csv_dir: Optional[Union[Path, str]] = None,
+                      start_eval_idx: int = 0):
     """
     objective_fn: mevcut objective (params -> float)
     pop_size    : her iterasyondaki parçacık sayısı (swarm/population)
     csv_dir     : CSV yazılacak klasör (None ise sadece konsol)
+    start_eval_idx: Resume için başlangıç indeksi (checkpoint'tan)
 
     Kullanım:
         obj_wrapped = with_eval_logging(objective, pop_size, csv_dir="optimization_temp")
         result = optimizer.minimize(obj_wrapped, ...)
     """
-    eval_idx = 0
+    eval_idx = start_eval_idx
     csv_f = None
     xlsx_path = None
     records = []  # XLSX için kayıtlar
@@ -635,9 +976,11 @@ def with_eval_logging(objective_fn: Callable,
         xlsx_path = csv_dir / f"eval_history_{stamp}.xlsx"
         
         csv_f = open(csv_path, "w", buffering=1)
-        # Genişletilmiş header
-        header = ("iteration,particle,objective,nmrse,ssim,base_gray,tex_mix,oren_rough,princ_rough,"
-                  "shader_mix,ior,q_eff,threshold_value,mars_rough,mars_albedo_mul,img_files")
+        # Dynamic header from PARAMETER_NAMES
+        param_cols = ",".join(PARAMETER_NAMES)
+        header = (f"particle_no,iteration,particle,objective,"
+                  f"nmrse,ssim,ms_ssim,gmsd,ncc,lpips,hist_corr,orb_penalty,"
+                  f"{param_cols},img_files")
         print(header, file=csv_f)
     
     # IMG dosya adlarını birleştir
@@ -654,44 +997,65 @@ def with_eval_logging(objective_fn: Callable,
             print(f"=== Iteration {it} ===")
             print(f"{'='*100}")
 
-        val = objective_fn(x)
+        # Map active-dim optimizer vector → full-dim param array
+        x_full = active_to_full(np.asarray(x))
+        val = objective_fn(x_full)
+
+        # WARMUP döneminde (val=inf) loglama yapma
+        if val == float('inf'):
+            print(f"  ⏭️ WARMUP iteration - skipping score logging")
+            eval_idx += 1
+            return val
 
         try:
             m = get_last_eval_metrics()
-            nmrse = float(m.get("nmrse", float("nan")))
-            ssim  = float(m.get("ssim",  float("nan")))
+            nmrse     = float(m.get("nmrse",     float("nan")))
+            ssim      = float(m.get("ssim",      float("nan")))
+            ms_ssim   = float(m.get("ms_ssim",   float("nan")))
+            gmsd      = float(m.get("gmsd",      float("nan")))
+            hist_corr = float(m.get("hist_corr", float("nan")))
+            orb_pen   = float(m.get("orb_penalty", 0.0))
+            ncc_m     = float(m.get("ncc",   float("nan")))
+            lpips_m   = float(m.get("lpips", float("nan")))
         except Exception:
             nmrse, ssim = float("nan"), float("nan")
+            ms_ssim, gmsd, hist_corr, orb_pen = float("nan"), float("nan"), float("nan"), 0.0
+            ncc_m, lpips_m = float("nan"), float("nan")
 
-        # Parametreleri al
-        params_dict = params_to_dict(x)
-        
-        # Konsol çıktısı - genişletilmiş
-        print(f"[it {it:03d} | p{pid:03d}] obj={val:+.6f}  NMRSE={nmrse:.6f}  SSIM={ssim:.6f}")
-        print(f"  Params: base_gray={params_dict['base_gray']:.4f}, tex_mix={params_dict['tex_mix']:.4f}, "
-              f"oren_rough={params_dict['oren_rough']:.4f}, princ_rough={params_dict['princ_rough']:.4f}")
-        print(f"          shader_mix={params_dict['shader_mix']:.4f}, ior={params_dict['ior']:.4f}, "
-              f"q_eff={params_dict['q_eff']:.4f}, threshold={params_dict['threshold_value']:.4f}, "
-              f"mars_rough={params_dict['mars_rough']:.4f}, mars_albedo_mul={params_dict['mars_albedo_mul']:.4f}")
+        # Parametreleri al (full-dim)
+        params_dict = params_to_dict(x_full)
+
+        # Global particle number (monotonically increasing)
+        particle_no = eval_idx
+
+        # Konsol çıktısı - dynamic
+        print(f"[it {it:03d} | p{pid:03d}] obj={val:+.6f}  NMRSE={nmrse:.6f}  SSIM={ssim:.6f}  NCC={ncc_m:.4f}  LPIPS={lpips_m:.4f}")
+        param_str = ", ".join(f"{k}={v:.4f}" for k, v in params_dict.items())
+        print(f"  Params: {param_str}")
         print(f"  IMG Files: {img_names}")
-        
+
         # CSV kaydı
         if csv_f:
-            csv_line = (f"{it},{pid},{val},{nmrse},{ssim},"
-                       f"{params_dict['base_gray']},{params_dict['tex_mix']},"
-                       f"{params_dict['oren_rough']},{params_dict['princ_rough']},"
-                       f"{params_dict['shader_mix']},{params_dict['ior']},"
-                       f"{params_dict['q_eff']},{params_dict['threshold_value']},"
-                       f"{params_dict['mars_rough']},{params_dict['mars_albedo_mul']},\"{img_names}\"")
+            param_vals = ",".join(str(params_dict[k]) for k in PARAMETER_NAMES)
+            csv_line = (f"{particle_no},{it},{pid},{val},"
+                        f"{nmrse},{ssim},{ms_ssim},{gmsd},{ncc_m},{lpips_m},"
+                        f"{hist_corr},{orb_pen},{param_vals},\"{img_names}\"")
             print(csv_line, file=csv_f)
-            
+
             # XLSX için kayıt
             record = {
+                'particle_no': particle_no,
                 'iteration': it,
                 'particle': pid,
                 'objective': val,
                 'nmrse': nmrse,
                 'ssim': ssim,
+                'ms_ssim': ms_ssim,
+                'gmsd': gmsd,
+                'ncc': ncc_m,
+                'lpips': lpips_m,
+                'hist_corr': hist_corr,
+                'orb_penalty': orb_pen,
                 **params_dict,
                 'img_files': img_names
             }
@@ -868,6 +1232,112 @@ def repair_params(params: np.ndarray, method: str = 'clip') -> np.ndarray:
     
     else:
         raise ValueError(f"Unknown repair method: {method}")
+
+
+# ============================================================================
+# CHECKPOINT MANAGER - Optimizer state'i kaydet ve yükle
+# ============================================================================
+
+import pickle
+
+def save_checkpoint(filepath: Union[str, Path],
+                   algorithm: str,
+                   optimizer_state: dict,
+                   best_params: np.ndarray,
+                   best_objective: float,
+                   iteration_count: int,
+                   config: dict,
+                   learned_k_db: Optional[dict] = None):
+    """
+    Optimizer state'ini dosyaya kaydet.
+    
+    Args:
+        filepath: Checkpoint dosya yolu
+        algorithm: 'pso', 'genetic', veya 'bayesian'
+        optimizer_state: Algoritma-specific state (particles, population, skopt optimizer)
+        best_params: En iyi parametreler
+        best_objective: En iyi objective değeri
+        iteration_count: Tamamlanan iterasyon sayısı
+        config: Optimizer config
+        learned_k_db: Learned k values database
+    """
+    filepath = Path(filepath)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    
+    checkpoint = {
+        'algorithm': algorithm,
+        'optimizer_state': optimizer_state,
+        'best_params': best_params,
+        'best_objective': best_objective,
+        'iteration_count': iteration_count,
+        'config': config,
+        'learned_k_db': learned_k_db,
+        'adaptive_crop_state': get_adaptive_crop_state(),
+        'timestamp': datetime.now().isoformat(),
+        'version': '1.0'
+    }
+    
+    with open(filepath, 'wb') as f:
+        pickle.dump(checkpoint, f)
+    
+    print(f"  💾 Checkpoint saved: {filepath}")
+    print(f"     Iteration: {iteration_count}, Best: {best_objective:.6f}")
+
+
+def load_checkpoint(filepath: Union[str, Path]) -> dict:
+    """
+    Checkpoint dosyasından state'i yükle.
+    
+    Args:
+        filepath: Checkpoint dosya yolu
+        
+    Returns:
+        Checkpoint dictionary
+    """
+    filepath = Path(filepath)
+    
+    if not filepath.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {filepath}")
+    
+    with open(filepath, 'rb') as f:
+        checkpoint = pickle.load(f)
+    
+    print(f"  📂 Checkpoint loaded: {filepath}")
+    print(f"     Algorithm: {checkpoint['algorithm']}")
+    print(f"     Iteration: {checkpoint['iteration_count']}")
+    print(f"     Best: {checkpoint['best_objective']:.6f}")
+    print(f"     Saved at: {checkpoint['timestamp']}")
+    
+    # Restore adaptive crop state
+    if checkpoint.get('adaptive_crop_state'):
+        global _ADAPTIVE_CROP_STATE
+        _ADAPTIVE_CROP_STATE.update(checkpoint['adaptive_crop_state'])
+        print(f"     Adaptive crop state restored")
+    
+    return checkpoint
+
+
+def get_checkpoint_path(temp_dir: Path, iteration: int) -> Path:
+    """Checkpoint dosya yolunu oluştur."""
+    checkpoint_dir = temp_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return checkpoint_dir / f"checkpoint_iter{iteration}_{timestamp}.pkl"
+
+
+def find_latest_checkpoint(temp_dir: Path) -> Optional[Path]:
+    """En son checkpoint dosyasını bul."""
+    checkpoint_dir = temp_dir / "checkpoints"
+    if not checkpoint_dir.exists():
+        return None
+    
+    checkpoints = list(checkpoint_dir.glob("checkpoint_*.pkl"))
+    if not checkpoints:
+        return None
+    
+    # En son değiştirileni bul
+    latest = max(checkpoints, key=lambda p: p.stat().st_mtime)
+    return latest
 
 
 if __name__ == "__main__":

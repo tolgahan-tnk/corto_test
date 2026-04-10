@@ -23,22 +23,32 @@ import openpyxl
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from optimization_helper import (
+    N_PARAMS,
     OptimizationLogger,
     evaluate_params_with_rendering,
     print_params_table,
     PARAMETER_BOUNDS,
-    with_eval_logging
+    with_eval_logging,
+    reset_adaptive_crop_state,
+    save_checkpoint,
+    load_checkpoint,
+    get_checkpoint_path,
+    set_fixed_params,
+    get_active_n_params
 )
 
 from PSO import run_pso
 from Genetic import run_genetic
+from Bayesian import run_bayesian
+from CMAES import run_cmaes, run_ipop_cmaes, run_bipop_cmaes
 
 # Add parent directory to path for phobos_data imports
 sys.path.append(str(Path(__file__).parent.parent.parent))
 from phobos_data import CompactPDSProcessor, HAS_SPICE, SpiceDataProcessor
+from mission_config import detect_mission, get_solar_distance_from_label, extract_pose_from_label
 
 
 # ============================================================================
@@ -117,63 +127,78 @@ def scan_pds_directory(pds_dir: Path,
     
     print(f"  Valid images: {len(df)}")
     
-    # Query SPICE for solar distances
-    print("\nStep 5: Querying SPICE for solar distances...")
-    
-    if not HAS_SPICE:
-        raise RuntimeError(
-            "❌ SPICE is required for optimization but not available!\n"
-            "Please install SPICE dependencies:\n"
-            "  pip install spiceypy\n"
-            "And ensure spice_data_processor.py is available."
-        )
-    
-    sdp = SpiceDataProcessor()
+    # Query geometry per file (per-file mission detection for mixed directories)
+    print("\nStep 5: Detecting mission and querying geometry...")
+
+    # Lazy SPICE init: only created if any file needs it
+    sdp = None
+
     img_info_list = []
-    
+    missions_seen = set()
+
     for idx, row in df.iterrows():
         img_name = row['file_name']
         utc_time = row['UTC_MEAN_TIME']
         img_path = row['file_path']
-        
-        print(f"  [{idx+1}/{len(df)}] {img_name}: {utc_time}", end="")
-        
+
+        # Per-file mission detection (supports mixed HRSC + OSIRIS directories)
+        file_mission_cfg = detect_mission(Path(img_path))
+        missions_seen.add(file_mission_cfg.mission_id)
+
+        print(f"  [{idx+1}/{len(df)}] {img_name} [{file_mission_cfg.mission_id}]: {utc_time}", end="")
+
         try:
-            # Query SPICE for this UTC time
-            spice_data = sdp.get_spice_data(utc_time)
-            solar_distance_km = float(spice_data['distances']['sun_to_phobos'])
-            
+            if file_mission_cfg.use_spice:
+                # ── HRSC path: SPICE query ──
+                if sdp is None:
+                    if not HAS_SPICE:
+                        raise RuntimeError(
+                            "SPICE is required for HRSC but not available!\n"
+                            "Install: pip install spiceypy"
+                        )
+                    sdp = SpiceDataProcessor()
+                spice_data = sdp.get_spice_data(utc_time)
+                solar_distance_km = float(spice_data['distances']['sun_to_phobos'])
+            else:
+                # ── Label path: extract from PDS header ──
+                solar_distance_km = get_solar_distance_from_label(Path(img_path))
+
             img_info = {
                 'filename': img_name,
                 'utc_time': utc_time,
                 'solar_distance_km': solar_distance_km,
-                'pds_path': img_path
+                'pds_path': img_path,
+                'mission_config': file_mission_cfg,   # per-file config
             }
-            
+
             img_info_list.append(img_info)
             print(f" → {solar_distance_km:.0f} km ✓")
-            
+
         except Exception as e:
-            print(f" → SPICE query failed: {e}")
+            print(f" → Query failed: {e}")
             print(f"     Skipping {img_name}")
             continue
-    
+
     if not img_info_list:
         raise RuntimeError("No images could be processed successfully")
-    
+
     # Summary
+    missions_str = ", ".join(sorted(missions_seen))
     print("\n" + "="*80)
     print("PDS SCAN COMPLETE")
     print("="*80)
+    print(f"Missions: {missions_str}")
     print(f"Total images ready for optimization: {len(img_info_list)}")
     print("\nImages:")
     for i, info in enumerate(img_info_list, 1):
-        print(f"  {i}. {info['filename']}")
+        mission_id = info['mission_config'].mission_id
+        print(f"  {i}. {info['filename']}  [{mission_id}]")
         print(f"     UTC: {info['utc_time']}")
         print(f"     Solar distance: {info['solar_distance_km']:.0f} km")
     print("="*80 + "\n")
-    
+
     return img_info_list
+
 
 
 # ============================================================================
@@ -181,7 +206,7 @@ def scan_pds_directory(pds_dir: Path,
 # ============================================================================
 
 DEFAULT_CONFIG = {
-    'objective_type': 'ssim',
+    'objective_type': 'combined',
     'evaluation_mode': 'cropped',
     'aggregation': 'mean',
     
@@ -215,10 +240,28 @@ DEFAULT_CONFIG = {
         'convergence_patience': 1000000000,
         'seed': None
     },
+
+    'bayesian': {
+        'n_calls': 50,
+        'n_initial_points': 10,
+        'acq_func': 'gp_hedge',
+        'xi': 0.01,
+        'kappa': 1.96,
+        'seed': None
+    },
+
+    'cmaes': {
+        'sigma0': 0.3,
+        'population_size': None,  # auto: 4 + floor(3*ln(n))
+        'n_iterations': 500,
+        'seed': None,
+        'convergence_threshold': 1e-11,
+        'convergence_patience': 1000000
+    },
     
     'output_dir': 'optimization_results',
     'experiment_name': 'phobos_optimization',
-    'temp_dir': str(Path(r"D:/CORTO/optimization_temp_combined_threshold_mars_018_2")), #'optimization_temp',
+    'temp_dir': str(Path(r"C:/CORTO/optimization_temp_combined_threshold_mars_018_2")), #'optimization_temp',
     'save_plots': True,
     'verbose_eval': False
 }
@@ -228,10 +271,18 @@ DEFAULT_CONFIG = {
 # OBJECTIVE FUNCTION FACTORY
 # ============================================================================
 
-def create_objective_function(config: Dict, img_info_list: List[Dict]):
-    """Create objective function from configuration."""
+def create_objective_function(config: Dict, img_info_list: List[Dict], resume_state: Optional[dict] = None):
+    """Create objective function from configuration.
     
-    particle_counter = {'count': 0}
+    Args:
+        config: Optimization configuration
+        img_info_list: List of image info dictionaries
+        resume_state: Optional checkpoint state for resuming
+    """
+    
+    # Resume: start from previous particle count
+    start_count = resume_state.get('iteration_count', 0) if resume_state else 0
+    particle_counter = {'count': start_count}
     learned_k_db: Dict[str, int] = {}
     
     def objective_function(params):
@@ -251,14 +302,34 @@ def create_objective_function(config: Dict, img_info_list: List[Dict]):
             learned_k_db=learned_k_db,
             blender_persistent=config.get('blender_persistent', True),
             blender_batch_size=config.get('blender_batch_size', None),
+            adaptive_crop_n=config.get('adaptive_crop_n', 0),  # YENİ: Adaptive crop
+            # YENİ: Atmosphere & Displacement
+            use_displacement=config.get('use_displacement', True),
+            use_atmosphere=config.get('use_atmosphere', True),
+            atm_color_mode=config.get('atm_color_mode', 'single'),
+            dem_path=config.get('dem_path', None),
+            fixed_k=config.get('fixed_k', None),
         )
     
-    # Wrapped objective with logging - img_info_list eklendi
+    # Wrapped objective with logging - start_eval_idx eklendi
+    # Bayesian tek tek değerlendirir (pop_size=1), PSO/Genetic popülasyon kullanır
+    algorithm = config['algorithm'].lower()
+    if algorithm in ['bayesian', 'bo']:
+        pop_size = 1  # Bayesian: her eval bir "iterasyon"
+    elif algorithm == 'pso':
+        pop_size = config['pso'].get('n_particles', 30)
+    elif algorithm == 'cmaes':
+        # CMA-ES: auto popsize = 4 + floor(3*ln(n)), fallback 11 for 14D
+        pop_size = config['cmaes'].get('population_size') or 11
+    else:  # genetic
+        pop_size = config['genetic'].get('population_size', 30)
+    
     wrapped_objective = with_eval_logging(
         objective_fn=objective_function,
-        pop_size=config[config['algorithm']].get('n_particles' if config['algorithm'] == 'pso' else 'population_size', 30),
-        img_info_list=img_info_list,  # ← YENİ PARAMETRE
-        csv_dir=Path(config.get('temp_dir', 'optimization_temp'))
+        pop_size=pop_size,
+        img_info_list=img_info_list,
+        csv_dir=Path(config.get('temp_dir', 'optimization_temp')),
+        start_eval_idx=start_count  # Resume: logging da doğru iterasyondan başlasın
     )
     
     return wrapped_objective
@@ -309,7 +380,7 @@ def main():
     # Algorithm selection
     parser.add_argument(
         '--algorithm',
-        choices=['pso', 'genetic', 'ga'],
+        choices=['pso', 'genetic', 'ga', 'bayesian', 'bo', 'cmaes'],
         default='pso',
         help='Optimization algorithm (default: pso)'
     )
@@ -336,9 +407,9 @@ def main():
     # Objective function settings
     parser.add_argument(
         '--objective',
-        choices=['ssim', 'rmse', 'nmrse', 'combined'],
+        choices=['ssim', 'rmse', 'nmrse', 'combined', 'combined-new'],
         default='ssim',
-        help='Objective function type (default: ssim)'
+        help='Objective function type (default: ssim). combined-new uses MS-SSIM + NMRSE + GMSD'
     )
     
     parser.add_argument(
@@ -350,9 +421,10 @@ def main():
     
     parser.add_argument(
         '--aggregation',
-        choices=['mean', 'median', 'max'],
+        choices=['mean', 'median', 'max', 'rss'],
         default='mean',
-        help='Multi-image aggregation method (default: mean)'
+        help="Multi-image aggregation: 'mean','median','max', or 'rss' (root-sum-of-squares). "
+             "Auto-set to 'rss' when >1 image and not explicitly overridden. (default: mean)"
     )
     
     # Output settings
@@ -393,11 +465,44 @@ def main():
         help='Verbose evaluation output'
     )
     
-    # parser = argparse.ArgumentParser(...)
     parser.add_argument("--blender-batch-size", type=int, default=100,
                         help="Sahneyi her N renderda bir yeniden kur (persistent cache)")
     parser.add_argument("--k-mode", choices=["sweep","learned"], default="learned",
                         help="k araması: 'sweep' ya da 'learned' (tek k, guard+dar bant teyit)")
+    parser.add_argument("--adaptive-crop", type=int, default=10, metavar="N",
+                        help="İlk N iterasyonda bbox öğren, sonra kilitle (0=devre dışı)")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Checkpoint dosyasından devam et (pickle)")
+    parser.add_argument("--fixed-k", type=int, default=None,
+                        help="K-percentile değerini sabitle (örn. 0). Otomatik k-sweep yerine bu değer kullanılır.")
+    parser.add_argument("--checkpoint-interval", type=int, default=50,
+                        help="Her N iterasyonda checkpoint kaydet (default: 50)")
+    parser.add_argument("--restarts", type=int, default=0,
+                        help="IPOP/BIPOP-CMA-ES restart sayisi (0=disabled, default: 0). "
+                             "Her restart'ta population 2x buyur, sigma 2x artar. "
+                             "Ornek: --restarts 2 -> Restart 0: lambda=11, Restart 1: lambda=22")
+    parser.add_argument("--bipop", action="store_true",
+                        help="BIPOP-CMA-ES kullan: buyuk pop (exploration) + kucuk pop (exploitation) "
+                             "donusumlu restart stratejisi. --restarts ile birlikte kullanilir.")
+    
+    # Render-only mode
+    parser.add_argument("--render-only", action="store_true",
+                        help="Sadece --params ile verilen parametrelerle render yap, optimizasyon yapma")
+    parser.add_argument("--params", type=str, default=None,
+                        help="Render için parametreler (virgülle ayrılmış): base_gray,tex_mix,...")
+
+    # ---- Atmosphere & Displacement ----
+    parser.add_argument("--no-atmosphere", action="store_true",
+                        help="Disable volumetric atmosphere sphere")
+    parser.add_argument("--no-displacement", action="store_true",
+                        help="Use bump mapping instead of MOLA DEM displacement")
+    parser.add_argument("--dem-path", type=str, default=None,
+                        help="Path to Mars DEM TIFF for displacement mapping")
+    parser.add_argument("--atm-color-mode", choices=['single', 'rgb'], default='single',
+                        help="Atmosphere color parameterization: 'single' (R only) or 'rgb' (default: single)")
+    parser.add_argument("--fix", type=str, nargs='*', default=[],
+                        help="Fix parameters at given values during optimization. "
+                             "Format: param=value (e.g., --fix atm_beta0=3e-4 atm_scale_height=11.0)")
 
     args = parser.parse_args()
     
@@ -435,28 +540,95 @@ def main():
     if args.verbose:
         config['verbose_eval'] = True
     
-    algorithm_key = 'pso' if args.algorithm == 'pso' else 'genetic'
+    if args.algorithm == 'pso':
+        algorithm_key = 'pso'
+    elif args.algorithm in ['genetic', 'ga']:
+        algorithm_key = 'genetic'
+    elif args.algorithm == 'cmaes':
+        algorithm_key = 'cmaes'
+    else:
+        algorithm_key = 'bayesian'
     
     if args.iterations:
         if args.algorithm == 'pso':
             config['pso']['n_iterations'] = args.iterations
-        else:
+        elif args.algorithm in ['genetic', 'ga']:
             config['genetic']['n_generations'] = args.iterations
+        elif args.algorithm in ['bayesian', 'bo']:
+            config['bayesian']['n_calls'] = args.iterations
+        elif args.algorithm == 'cmaes':
+            config['cmaes']['n_iterations'] = args.iterations
     
     if args.population:
         if args.algorithm == 'pso':
             config['pso']['n_particles'] = args.population
+        elif args.algorithm == 'cmaes':
+            config['cmaes']['population_size'] = args.population
         else:
             config['genetic']['population_size'] = args.population
     
     if args.seed:
         config[algorithm_key]['seed'] = args.seed
 
-    # --- : CLI'dan gelen k arama modu config'e yaz ---
+    # --- CLI'dan gelen k arama modu config'e yaz ---
     config['k_mode'] = args.k_mode
-    # YENİ: Blender kalıcılık/batch ayarları
+    config['fixed_k'] = args.fixed_k
+    # Blender kaliicilik/batch ayarlari
     config['blender_persistent'] = True
     config['blender_batch_size'] = args.blender_batch_size
+    # Adaptive crop ayari
+    config['adaptive_crop_n'] = args.adaptive_crop
+    # Checkpoint ayarlari
+    config['checkpoint_interval'] = args.checkpoint_interval
+    config['resume_from'] = args.resume
+    # IPOP/BIPOP-CMA-ES restart sayisi
+    config['ipop_restarts'] = args.restarts
+    config['use_bipop'] = getattr(args, 'bipop', False)
+
+    # ---- Atmosphere & Displacement config ----
+    config['use_atmosphere'] = not args.no_atmosphere
+    config['use_displacement'] = not args.no_displacement
+    config['atm_color_mode'] = args.atm_color_mode
+    config['dem_path'] = args.dem_path
+
+    # ---- Fixed parameters ----
+    if args.fix:
+        fixed_dict = {}
+        for item in args.fix:
+            if '=' not in item:
+                print(f"❌ Invalid --fix format: '{item}'. Use param=value")
+                sys.exit(1)
+            k, v = item.split('=', 1)
+            try:
+                fixed_dict[k.strip()] = float(v.strip())
+            except ValueError:
+                print(f"❌ Cannot parse --fix value for '{k}': '{v}'")
+                sys.exit(1)
+        set_fixed_params(fixed_dict)
+
+    # ---- If single-channel atm color mode, fix G/B channels ----
+    if config['atm_color_mode'] == 'single' and config['use_atmosphere']:
+        # In single mode, G and B are derived from R; fix them at defaults
+        from optimization_helper import FIXED_PARAMS
+        if 'atm_color_g' not in FIXED_PARAMS:
+            FIXED_PARAMS['atm_color_g'] = 0.5  # Will be overridden by proportional math
+        if 'atm_color_b' not in FIXED_PARAMS:
+            FIXED_PARAMS['atm_color_b'] = 0.3
+        print(f"  ℹ️ Single-channel atm color mode: fixed atm_color_g, atm_color_b")
+
+    # ---- If atmosphere disabled, fix all atm params ----
+    if not config['use_atmosphere']:
+        from optimization_helper import FIXED_PARAMS
+        atm_defaults = {
+            'atm_beta0': 3e-4, 'atm_scale_height': 11.0, 'atm_anisotropy': 0.6,
+            'atm_color_r': 0.8, 'atm_color_g': 0.5, 'atm_color_b': 0.3
+        }
+        for k, v in atm_defaults.items():
+            if k not in FIXED_PARAMS:
+                FIXED_PARAMS[k] = v
+        print(f"  ℹ️ Atmosphere disabled: all atm params fixed at defaults")
+
+    print(f"  📐 Active optimization dimensions: {get_active_n_params()}")
     # ========== Scan PDS Directory ==========
     try:
         img_info_list = scan_pds_directory(
@@ -465,8 +637,20 @@ def main():
             img_pattern=args.img_pattern
         )
     except Exception as e:
-        print(f"\n❌ Error scanning PDS directory: {e}")
+        print(f"\nError scanning PDS directory: {e}")
         sys.exit(1)
+
+    # ── Auto-select RSS aggregation when >1 image ──
+    # Only activates when user did not explicitly pass --aggregation flag
+    # (argparse default is 'mean', so check if user left it at default)
+    _user_set_aggregation = args.aggregation != 'mean'
+    if len(img_info_list) > 1 and not _user_set_aggregation:
+        config['aggregation'] = 'rss'
+        print(f"  [INFO] {len(img_info_list)} images detected "
+              f"-> aggregation auto-set to 'rss' (root-sum-of-squares)")
+    elif _user_set_aggregation:
+        config['aggregation'] = args.aggregation
+        print(f"  [INFO] Aggregation: {config['aggregation']} (from --aggregation flag)")
     
     # ========== Initialize Logger ==========
     output_dir = Path(config['output_dir'])
@@ -496,8 +680,77 @@ def main():
     for name, (lower, upper) in PARAMETER_BOUNDS.items():
         logger.log(f"  {name:<15}: [{lower:.4f}, {upper:.4f}]")
     
+    # ========== Reset Adaptive Crop State (YENİ) ==========
+    if config.get('adaptive_crop_n', 0) > 0:
+        reset_adaptive_crop_state(config['adaptive_crop_n'])
+        logger.log(f"\n🔄 Adaptive Crop enabled: will lock bbox after {config['adaptive_crop_n']} evaluations")
+    
+    # ========== Load Checkpoint (YENİ) ==========
+    resume_state = None
+    if config.get('resume_from'):
+        checkpoint_path = Path(config['resume_from'])
+        if checkpoint_path.exists():
+            resume_state = load_checkpoint(checkpoint_path)
+            logger.log(f"\n📂 Resuming from checkpoint: {checkpoint_path}")
+            logger.log(f"   Previous iterations: {resume_state['iteration_count']}")
+            logger.log(f"   Previous best: {resume_state['best_objective']:.6f}")
+            
+            # Checkpoint'taki algoritma mevcut algoritmayla eşleşmeli
+            if resume_state['algorithm'] != config['algorithm'].lower():
+                logger.log(f"⚠️ Warning: checkpoint algorithm ({resume_state['algorithm']}) differs from current ({config['algorithm']})")
+        else:
+            logger.log(f"⚠️ Checkpoint file not found: {checkpoint_path}")
+    
     # ========== Create Objective Function ==========
-    objective_function = create_objective_function(config, img_info_list)
+    objective_function = create_objective_function(config, img_info_list, resume_state)
+    
+    # ========== RENDER-ONLY MODE ==========
+    if args.render_only:
+        if not args.params:
+            logger.log("❌ --render-only requires --params argument!")
+            logger.log("   Example: --params 0.338531,0.921311,0.855890,1.0,0.319419,1.754619,0.826627,0.011097,0.634067,209.046147")
+            sys.exit(1)
+        
+        # Parse parameters
+        try:
+            param_values = [float(x.strip()) for x in args.params.split(',')]
+            if len(param_values) != N_PARAMS:
+                logger.log(f"❌ Expected {N_PARAMS} parameters, got {len(param_values)}")
+                sys.exit(1)
+            params = np.array(param_values)
+        except ValueError as e:
+            logger.log(f"❌ Could not parse parameters: {e}")
+            sys.exit(1)
+        
+        logger.log("\n" + "="*60)
+        logger.log("RENDER-ONLY MODE")
+        logger.log("="*60)
+        print_params_table(params)
+        
+        # Evaluate with these parameters (this does the render)
+        logger.log("\nRendering with given parameters...")
+        score = objective_function(params)
+        
+        logger.log(f"\n✅ Render complete!")
+        logger.log(f"   Objective score: {score:.6f}")
+        logger.log(f"   Output dir: {config['temp_dir']}")
+        
+        # Show where files are
+        render_dir = Path(config['temp_dir']) / "particle_000"
+        if render_dir.exists():
+            for f in render_dir.glob("*.png"):
+                logger.log(f"   📷 {f}")
+        
+        # Save .blend file for inspection
+        try:
+            from corto_renderer import save_debug_scene
+            blend_path = save_debug_scene(render_dir, particle_id=0)
+            if blend_path:
+                logger.log(f"   📁 Blend file: {blend_path}")
+        except Exception as e:
+            logger.log(f"   ⚠️ Could not save .blend file: {e}")
+        
+        sys.exit(0)
     
     # ========== Run Optimization ==========
     try:
@@ -505,19 +758,97 @@ def main():
         
         if algorithm == 'pso':
             logger.log("\nRunning Particle Swarm Optimization...")
+            # Checkpoint ayarlarını config'e ekle
+            config['pso']['checkpoint_interval'] = config.get('checkpoint_interval', 50)
+            config['pso']['temp_dir'] = str(config.get('temp_dir', 'optimization_temp'))
+            
+            # Resume state varsa optimizer_state'i al
+            pso_resume = None
+            if resume_state and resume_state.get('algorithm') == 'pso':
+                pso_resume = resume_state.get('optimizer_state')
+            
             results = run_pso(
                 objective_function=objective_function,
                 config=config['pso'],
-                logger=logger
+                logger=logger,
+                resume_state=pso_resume
             )
         
         elif algorithm in ['genetic', 'ga']:
             logger.log("\nRunning Genetic Algorithm...")
+            # Checkpoint ayarlarını config'e ekle
+            config['genetic']['checkpoint_interval'] = config.get('checkpoint_interval', 50)
+            config['genetic']['temp_dir'] = str(config.get('temp_dir', 'optimization_temp'))
+            
+            # Resume state varsa optimizer_state'i al
+            genetic_resume = None
+            if resume_state and resume_state.get('algorithm') == 'genetic':
+                genetic_resume = resume_state.get('optimizer_state')
+            
             results = run_genetic(
                 objective_function=objective_function,
                 config=config['genetic'],
-                logger=logger
+                logger=logger,
+                resume_state=genetic_resume
             )
+
+        elif algorithm in ['bayesian', 'bo']:
+            logger.log("\nRunning Bayesian Optimization...")
+            # Checkpoint ayarlarını config'e ekle
+            config['bayesian']['checkpoint_interval'] = config.get('checkpoint_interval', 50)
+            config['bayesian']['temp_dir'] = str(config.get('temp_dir', 'optimization_temp'))
+            
+            # Resume state varsa optimizer_state'i al
+            bayesian_resume = None
+            if resume_state and resume_state.get('algorithm') == 'bayesian':
+                bayesian_resume = resume_state.get('optimizer_state')
+            
+            results = run_bayesian(
+                objective_function=objective_function,
+                config=config['bayesian'],
+                logger=logger,
+                resume_state=bayesian_resume
+            )
+        
+        elif algorithm == 'cmaes':
+            n_restarts = config.get('ipop_restarts', 0)
+            if n_restarts > 0:
+                logger.log(f"\nRunning IPOP-CMA-ES Optimization ({n_restarts} restarts)...")
+            else:
+                logger.log("\nRunning CMA-ES Optimization...")
+            config['cmaes']['checkpoint_interval'] = config.get('checkpoint_interval', 50)
+            config['cmaes']['temp_dir'] = str(config.get('temp_dir', 'optimization_temp'))
+
+            cmaes_resume = None
+            if resume_state and resume_state.get('algorithm') == 'cmaes':
+                cmaes_resume = resume_state.get('optimizer_state')
+
+            if n_restarts > 0:
+                if config.get('use_bipop', False):
+                    # -- BIPOP-CMA-ES --
+                    logger.log(f"\nRunning BIPOP-CMA-ES Optimization ({n_restarts} restarts)...")
+                    results = run_bipop_cmaes(
+                        objective_function=objective_function,
+                        config=config['cmaes'],
+                        logger=logger,
+                        n_restarts=n_restarts
+                    )
+                else:
+                    # -- IPOP-CMA-ES --
+                    results = run_ipop_cmaes(
+                        objective_function=objective_function,
+                        config=config['cmaes'],
+                        logger=logger,
+                        n_restarts=n_restarts
+                    )
+            else:
+                # ── Standard CMA-ES (original behavior) ──
+                results = run_cmaes(
+                    objective_function=objective_function,
+                    config=config['cmaes'],
+                    logger=logger,
+                    resume_state=cmaes_resume
+                )
         
         else:
             raise ValueError(f"Unknown algorithm: {algorithm}")
@@ -545,13 +876,39 @@ def main():
         
         # Save final results with IMG info
         final_results_file = output_dir / f"{experiment_name}_{logger.timestamp}_final.json"
+        best_p = results['best_params']
+
+        # Serialize img_info_list: strip MissionConfig (not JSON-serializable)
+        def _serializable_img_info(info):
+            mission_cfg = info.get('mission_config')
+            return {
+                'filename': info['filename'],
+                'utc_time': info['utc_time'],
+                'solar_distance_km': float(info['solar_distance_km']),
+                'pds_path': str(info['pds_path']),
+                'mission_id': mission_cfg.mission_id if mission_cfg else 'UNKNOWN',
+                'use_spice': bool(mission_cfg.use_spice) if mission_cfg else False,
+            }
+
+        # Serialize config: strip any non-serializable values
+        def _safe_config(cfg):
+            safe = {}
+            for k, v in cfg.items():
+                try:
+                    import json as _json
+                    _json.dumps(v)
+                    safe[k] = v
+                except (TypeError, ValueError):
+                    safe[k] = str(v)
+            return safe
+
         with open(final_results_file, 'w') as f:
             json.dump({
-                'config': config,
-                'images': img_info_list,
+                'config': _safe_config(config),
+                'images': [_serializable_img_info(i) for i in img_info_list],
                 'results': {
                     'best_objective': float(results['best_objective']),
-                    'best_params': results['best_params'].tolist(),
+                    'best_params': best_p.tolist() if best_p is not None else None,
                     'n_iterations': results.get('n_iterations', results.get('n_generations', 0))
                 }
             }, f, indent=2)

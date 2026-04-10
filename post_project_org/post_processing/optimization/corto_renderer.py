@@ -50,6 +50,8 @@ from phobos_scene import (
     force_nvidia_gpu,
     build_scene_and_materials,
     set_phobos_params,
+    set_atmosphere_params,
+    set_mars_params,
     add_asset_paths
 )
 
@@ -62,13 +64,15 @@ from phobos_data import (
     SpiceDataProcessor
 )
 
+from mission_config import extract_pose_from_label
+
 
 # ============================================================================
 # SPICE DATA CACHE
 # ============================================================================
 
 class SPICEDataCache:
-    """Cache SPICE data for multiple IMG files to avoid redundant queries."""
+    """Cache SPICE/label data for multiple IMG files to avoid redundant queries."""
     
     def __init__(self):
         self.cache = {}
@@ -78,7 +82,7 @@ class SPICEDataCache:
             self.sdp = SpiceDataProcessor()
     
     def get_spice_data(self, utc_time: str) -> Dict:
-        """Get SPICE data with caching."""
+        """Get SPICE data with caching (HRSC path)."""
         if utc_time not in self.cache:
             if self.sdp is None:
                 raise RuntimeError("SPICE not available!")
@@ -86,6 +90,15 @@ class SPICEDataCache:
             self.cache[utc_time] = get_spice_data_for_time(self.sdp, utc_time)
         
         return self.cache[utc_time]
+    
+    def get_label_data(self, pds_path: str, mission_cfg) -> Dict:
+        """Get pose data from PDS label with caching (OSIRIS/generic path)."""
+        cache_key = str(pds_path)
+        if cache_key not in self.cache:
+            self.cache[cache_key] = extract_pose_from_label(
+                Path(pds_path), mission_cfg
+            )
+        return self.cache[cache_key]
 
 
 # ============================================================================
@@ -95,10 +108,12 @@ class SPICEDataCache:
 # ---- Modül-yerel tekil renderer (tüm parçacıklar boyunca reuse) ----
 _GLOBAL_RENDERER = None
 
-def get_renderer(persistent: bool = True, batch_size: Optional[int] = None):
+def get_renderer(persistent: bool = True, batch_size: Optional[int] = None, **kwargs):
     global _GLOBAL_RENDERER
     if _GLOBAL_RENDERER is None:
-        _GLOBAL_RENDERER = CORTORenderer(persistent=persistent, batch_size=batch_size)
+        _GLOBAL_RENDERER = CORTORenderer(
+            persistent=persistent, batch_size=batch_size, **kwargs
+        )
     else:
         # batch_size değişmişse güncelle
         _GLOBAL_RENDERER.batch_size = batch_size
@@ -117,7 +132,11 @@ class CORTORenderer:
                  temp_dir: Optional[Path] = None,
                  cleanup: bool = True,
                  persistent: bool = True,
-                 batch_size: Optional[int] = None):
+                 batch_size: Optional[int] = None,
+                 use_displacement: bool = True,
+                 use_atmosphere: bool = True,
+                 atm_color_mode: str = 'single',
+                 dem_path: Optional[str] = None):
         """
         Initialize CORTO renderer.
         
@@ -126,11 +145,17 @@ class CORTORenderer:
             body_files: List of body OBJ files [phobos.obj, mars.obj, deimos.obj]
             temp_dir: Temporary directory for intermediate files
             cleanup: Whether to clean up temp files after rendering
+            persistent: Keep scene between renders
+            batch_size: Rebuild scene after this many renders
+            use_displacement: Use MOLA DEM displacement (vs bump mapping)
+            use_atmosphere: Create volumetric atmosphere sphere
+            atm_color_mode: 'single' or 'rgb' (atmosphere color parameterization)
+            dem_path: Optional path to Mars DEM TIFF for displacement
         """
         self.scenario_name = scenario_name
         self.body_files = body_files or [
-            "g_phobos_018m_spc_0000n00000_v002.obj",
-            "Mars_65k.obj",
+            "g_phobos_144m_spc_0000n00000_v002.obj",
+            "Mars_65k_km.obj",
             "g_deimos_162m_spc_0000n00000_v001.obj",
         ]
         self.temp_dir = Path(temp_dir) if temp_dir else Path(tempfile.mkdtemp(prefix="corto_opt_"))
@@ -138,6 +163,10 @@ class CORTORenderer:
         self.cleanup = cleanup
         self.persistent = persistent
         self.batch_size = batch_size
+        self.use_displacement = use_displacement
+        self.use_atmosphere = use_atmosphere
+        self.atm_color_mode = atm_color_mode
+        self.dem_path = dem_path
 
         # Kalıcı sahne önbelleği
         self._built = False
@@ -149,7 +178,8 @@ class CORTORenderer:
 
         # SPICE cache & camera
         self.spice_cache = SPICEDataCache()
-        self.camera_config = get_camera_config()
+        self.mission_config = None  # Set per-image from img_info
+        self.camera_config = get_camera_config()  # Default: HRSC from SPICE
         self.sun_blender_scaler = 3.90232e-1
 
         # PERSIST ve BATCH kontrolü
@@ -165,6 +195,8 @@ class CORTORenderer:
         print(f"  Temp dir: {self.temp_dir}")
         print(f"  Cleanup: {cleanup}")
         print(f"  Persistent: {self.persistent}, Batch size: {self.batch_size}")
+        print(f"  Displacement: {self.use_displacement}, Atmosphere: {self.use_atmosphere}")
+        print(f"  Atm color mode: {self.atm_color_mode}")
 
     def _build_or_reuse_scene(self, spice_data: Dict):
         """Sahneyi ilk kez kur veya batch sınırı geldiyse yeniden kur; aksi halde sadece güncelle."""
@@ -221,8 +253,13 @@ class CORTORenderer:
 
             # State ve sahne kurulumu
             self._State = corto.State(scene=scene_filename, geometry=geom_filename, body=self.body_files, scenario=self.scenario_name)
-            add_asset_paths(self._State)
-            self._ENV, self._cam, self._sun, _bodies, self._mat_nodes, _tree = build_scene_and_materials(self._State, self.body_files)
+            add_asset_paths(self._State, dem_path=self.dem_path, body_names=self.body_files)
+            self._ENV, self._cam, self._sun, _bodies, self._mat_nodes, _tree = build_scene_and_materials(
+                self._State, self.body_files,
+                use_displacement=self.use_displacement,
+                use_atmosphere=self.use_atmosphere,
+                atm_color_mode=self.atm_color_mode
+            )
 
             self._prepared = True
             self._batch_count = 0
@@ -253,15 +290,38 @@ class CORTORenderer:
             True if successful, False otherwise
         """
         try:
-            spice_data = self.spice_cache.get_spice_data(img_info['utc_time'])
+            # Get mission config from img_info (if available)
+            mission_cfg = img_info.get('mission_config', None)
+            
+            if mission_cfg is not None and not mission_cfg.use_spice:
+                # ── Label path (OSIRIS, generic) ──
+                spice_data = self.spice_cache.get_label_data(
+                    img_info['pds_path'], mission_cfg
+                )
+                # Update camera config from mission
+                if mission_cfg.camera_config is not None:
+                    self.camera_config = mission_cfg.camera_config
+            else:
+                # ── SPICE path (HRSC, original behavior) ──
+                spice_data = self.spice_cache.get_spice_data(img_info['utc_time'])
+            
             self._build_or_reuse_scene(spice_data)
 
             # Parametreleri uygula (yalnızca node değerleri güncellenir)
             params_dict = self._params_to_dict(params)
             set_phobos_params(self._mat_nodes, params_dict)
+            # Apply Mars hybrid shader parameters
+            set_mars_params(self._mat_nodes, params_dict)
+            # Apply atmosphere parameters
+            set_atmosphere_params(self._mat_nodes, params_dict)
 
             # q_eff'e göre güneş enerjisi
-            solar_distance_km = float(spice_data['distances']['sun_to_phobos'])
+            # Use sun_to_target for label path, sun_to_phobos for SPICE path
+            dist_key = getattr(mission_cfg, 'solar_distance_key', 'sun_to_phobos') if mission_cfg else 'sun_to_phobos'
+            solar_distance_km = float(
+                spice_data['distances'].get(dist_key,
+                    spice_data['distances'].get('sun_to_phobos', 0))
+            )
             q_eff = float(params_dict['q_eff'])
             sun_energy = calculate_sun_strength(solar_distance_km, q_eff=q_eff, sun_blender_scaler=self.sun_blender_scaler)
             self._sun.set_energy(sun_energy)
@@ -311,11 +371,9 @@ class CORTORenderer:
             return False
     
     def _params_to_dict(self, params: np.ndarray) -> Dict[str, float]:
-        """Convert parameter array to dictionary."""
-        param_names = ['base_gray', 'tex_mix', 'oren_rough', 'princ_rough',
-                       'shader_mix', 'ior', 'q_eff', 'threshold_value',
-                       'mars_rough', 'mars_albedo_mul']
-        return {name: float(val) for name, val in zip(param_names, params)}
+        """Convert parameter array to dictionary using canonical names."""
+        from optimization_helper import PARAMETER_NAMES
+        return {name: float(val) for name, val in zip(PARAMETER_NAMES, params)}
     
     def cleanup_temp(self):
         """Clean up temporary files."""
@@ -341,16 +399,26 @@ def render_synthetic_for_params(
     output_dir: Path,
     particle_id: int,
     persistent: bool = True,
-    batch_size: Optional[int] = None
+    batch_size: Optional[int] = None,
+    use_displacement: bool = True,
+    use_atmosphere: bool = True,
+    atm_color_mode: str = 'single',
+    dem_path: Optional[str] = None
 ) -> List[Path]:
     """
     Render synthetic images for multiple real IMG files with given parameters.
     
     Args:
         img_info_list: List of IMG info dicts (filename, utc_time, etc.)
-        params: Photometric parameters [10 values]
+        params: Photometric parameters
         output_dir: Directory for output files
         particle_id: Particle/individual ID for naming
+        persistent: Keep Blender scene between renders
+        batch_size: Rebuild scene every N renders
+        use_displacement: True displacement vs bump mapping
+        use_atmosphere: Create volumetric atmosphere sphere
+        atm_color_mode: 'single' or 'rgb'
+        dem_path: Optional Mars DEM TIFF path
         
     Returns:
         List of paths to rendered PNG files
@@ -358,7 +426,13 @@ def render_synthetic_for_params(
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    renderer = get_renderer(persistent=persistent, batch_size=batch_size)
+    renderer = get_renderer(
+        persistent=persistent, batch_size=batch_size,
+        use_displacement=use_displacement,
+        use_atmosphere=use_atmosphere,
+        atm_color_mode=atm_color_mode,
+        dem_path=dem_path
+    )
     rendered_files = []
     
     for i, img_info in enumerate(img_info_list):

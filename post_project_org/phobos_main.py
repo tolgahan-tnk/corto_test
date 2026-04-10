@@ -178,7 +178,7 @@ def run_pds_simulations(
             body=body_name,
             scenario=scenario_name
         )
-        add_asset_paths(State_img)
+        add_asset_paths(State_img, body_names=body_name)
         
         print(f" ✅ Using SPICE positioning")
         print(f" Solar distance: {solar_distance_km:.0f} km")

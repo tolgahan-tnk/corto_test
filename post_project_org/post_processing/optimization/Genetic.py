@@ -23,10 +23,13 @@ from pathlib import Path
 from optimization_helper import (
     N_PARAMS,
     get_bounds_arrays,
+    get_active_n_params,
     clip_params,
     repair_params,
     OptimizationLogger,
-    print_params_table
+    print_params_table,
+    save_checkpoint,
+    get_checkpoint_path
 )
 
 
@@ -59,7 +62,10 @@ class GeneticAlgorithm:
                  convergence_threshold: float = 1e-6,
                  convergence_patience: int = 10,
                  seed: Optional[int] = None,
-                 logger: Optional[OptimizationLogger] = None):
+                 logger: Optional[OptimizationLogger] = None,
+                 checkpoint_interval: int = 50,
+                 temp_dir: Optional[str] = None,
+                 resume_state: Optional[dict] = None):
         """
         Initialize Genetic Algorithm.
         
@@ -78,10 +84,15 @@ class GeneticAlgorithm:
             convergence_patience: Generations without improvement before stopping
             seed: Random seed
             logger: Optional logger
+            checkpoint_interval: Save checkpoint every N generations
+            temp_dir: Directory for checkpoint files
+            resume_state: Previous optimizer state to resume from
         """
         self.objective_function = objective_function
         self.population_size = population_size if population_size % 2 == 0 else population_size + 1
         self.n_generations = n_generations
+        self.checkpoint_interval = checkpoint_interval
+        self.temp_dir = Path(temp_dir) if temp_dir else None
         
         # GA parameters
         self.crossover_prob = crossover_prob
@@ -103,25 +114,39 @@ class GeneticAlgorithm:
         # Logger
         self.logger = logger
         
-        # Bounds
+        # Bounds (active params only)
         self.lower, self.upper = get_bounds_arrays()
+        self.n_dims = get_active_n_params()
         self.range = self.upper - self.lower
         
-        # Population state
-        self.population = None
-        self.fitness = None
-        self.best_individual = None
-        self.best_fitness = None
-        
-        # History
-        self.best_history = []
-        self.diversity_history = []
+        # Resume from checkpoint or initialize fresh
+        if resume_state:
+            self.population = resume_state.get('population')
+            self.fitness = resume_state.get('fitness')
+            self.best_individual = resume_state.get('best_individual')
+            self.best_fitness = resume_state.get('best_fitness', np.inf)
+            self.best_history = resume_state.get('best_history', [])
+            self.diversity_history = resume_state.get('diversity_history', [])
+            self.start_generation = resume_state.get('iteration_count', 0)
+            self._log(f"  ✅ Resumed from generation {self.start_generation}")
+        else:
+            # Population state
+            self.population = None
+            self.fitness = None
+            self.best_individual = None
+            self.best_fitness = None
+            
+            # History
+            self.best_history = []
+            self.diversity_history = []
+            self.start_generation = 0
         
         self._log("Genetic Algorithm initialized")
         self._log(f"  Population size: {self.population_size}")
         self._log(f"  Generations: {n_generations}")
         self._log(f"  Crossover prob: {crossover_prob}, eta: {crossover_eta}")
         self._log(f"  Mutation prob: {mutation_prob}, eta: {mutation_eta}")
+        self._log(f"  Checkpoint interval: {checkpoint_interval}")
     
     def _log(self, message: str):
         """Log message."""
@@ -136,7 +161,7 @@ class GeneticAlgorithm:
         
         self.population = np.random.uniform(
             self.lower, self.upper,
-            size=(self.population_size, N_PARAMS)
+            size=(self.population_size, self.n_dims)
         )
         
         self.fitness = np.full(self.population_size, np.inf)
@@ -200,7 +225,7 @@ class GeneticAlgorithm:
         if np.random.random() > self.crossover_prob:
             return offspring1, offspring2
         
-        for i in range(N_PARAMS):
+        for i in range(self.n_dims):
             if np.random.random() < 0.5:
                 if abs(parent1[i] - parent2[i]) > 1e-9:
                     # SBX crossover
@@ -231,7 +256,7 @@ class GeneticAlgorithm:
         """
         mutated = individual.copy()
         
-        for i in range(N_PARAMS):
+        for i in range(self.n_dims):
             if np.random.random() < self.mutation_prob:
                 y = mutated[i]
                 yl = self.lower[i]
@@ -327,18 +352,24 @@ class GeneticAlgorithm:
         self._log("Starting Genetic Algorithm Optimization")
         self._log("="*80)
         
-        # Initialize
-        self.initialize_population()
-        
-        # Initial evaluation
-        self.evaluate_population()
-        self.best_history.append(self.best_fitness)
-        self.diversity_history.append(self.compute_diversity())
-        
-        self._log(f"Initial best fitness: {self.best_fitness:.6f}")
+        # Initialize only if not resuming
+        if self.start_generation == 0:
+            self.initialize_population()
+            
+            # Initial evaluation
+            self.evaluate_population()
+            self.best_history.append(self.best_fitness)
+            self.diversity_history.append(self.compute_diversity())
+            
+            self._log(f"Initial best fitness: {self.best_fitness:.6f}")
+        else:
+            self._log(f"Resuming from generation {self.start_generation}")
+            self._log(f"Current best: {self.best_fitness:.6f}")
         
         # Main loop
         for generation in range(1, self.n_generations + 1):
+            total_generation = self.start_generation + generation
+            
             # Create offspring
             offspring_pop = self.create_offspring()
             
@@ -375,7 +406,7 @@ class GeneticAlgorithm:
                     self.logger.update_best(
                         objective=self.best_fitness,
                         params=self.best_individual,
-                        generation=generation
+                        generation=total_generation
                     )
             
             # Track history
@@ -385,21 +416,44 @@ class GeneticAlgorithm:
             
             # Log progress
             if generation % 10 == 0 or generation == 1:
-                self._log(f"Generation {generation}/{self.n_generations}: "
+                self._log(f"Generation {total_generation}/{self.start_generation + self.n_generations}: "
                          f"Best = {self.best_fitness:.6f}, "
                          f"Diversity = {diversity:.6f}")
                 
                 if self.logger:
                     self.logger.log_iteration(
-                        iteration=generation,
+                        iteration=total_generation,
                         best_objective=self.best_fitness,
                         best_params=self.best_individual,
                         diversity=diversity
                     )
             
+            # Checkpoint kaydet
+            if self.checkpoint_interval > 0 and total_generation % self.checkpoint_interval == 0:
+                if self.temp_dir:
+                    checkpoint_path = get_checkpoint_path(self.temp_dir, total_generation)
+                    optimizer_state = {
+                        'population': self.population,
+                        'fitness': self.fitness,
+                        'best_individual': self.best_individual,
+                        'best_fitness': self.best_fitness,
+                        'best_history': self.best_history,
+                        'diversity_history': self.diversity_history,
+                        'iteration_count': total_generation
+                    }
+                    save_checkpoint(
+                        filepath=checkpoint_path,
+                        algorithm='genetic',
+                        optimizer_state=optimizer_state,
+                        best_params=self.best_individual,
+                        best_objective=self.best_fitness,
+                        iteration_count=total_generation,
+                        config={'population_size': self.population_size, 'n_generations': self.n_generations}
+                    )
+            
             # Check convergence
             if self.check_convergence():
-                self._log(f"\nConverged at generation {generation}")
+                self._log(f"\nConverged at generation {total_generation}")
                 break
         
         # Final results
@@ -420,7 +474,8 @@ class GeneticAlgorithm:
 
 def run_genetic(objective_function: Callable,
                 config: Optional[Dict] = None,
-                logger: Optional[OptimizationLogger] = None) -> Dict:
+                logger: Optional[OptimizationLogger] = None,
+                resume_state: Optional[dict] = None) -> Dict:
     """
     Run Genetic Algorithm optimization with configuration.
     
@@ -428,6 +483,7 @@ def run_genetic(objective_function: Callable,
         objective_function: Function to minimize
         config: Configuration dictionary with GA parameters
         logger: Optional logger
+        resume_state: Optional state to resume from
         
     Returns:
         Dictionary with results
@@ -445,7 +501,9 @@ def run_genetic(objective_function: Callable,
         'boundary_method': 'clip',
         'convergence_threshold': 1e-6,
         'convergence_patience': 10,
-        'seed': None
+        'seed': None,
+        'checkpoint_interval': 50,
+        'temp_dir': None
     }
     
     # Update with user config
@@ -456,6 +514,7 @@ def run_genetic(objective_function: Callable,
     ga = GeneticAlgorithm(
         objective_function=objective_function,
         logger=logger,
+        resume_state=resume_state,
         **default_config
     )
     

@@ -18,10 +18,13 @@ from pathlib import Path
 from optimization_helper import (
     N_PARAMS,
     get_bounds_arrays,
+    get_active_n_params,
     clip_params,
     repair_params,
     OptimizationLogger,
-    print_params_table
+    print_params_table,
+    save_checkpoint,
+    get_checkpoint_path
 )
 
 
@@ -54,7 +57,10 @@ class ParticleSwarmOptimizer:
                  convergence_threshold: float = 1e-6,
                  convergence_patience: int = 10,
                  seed: Optional[int] = None,
-                 logger: Optional[OptimizationLogger] = None):
+                 logger: Optional[OptimizationLogger] = None,
+                 checkpoint_interval: int = 50,
+                 temp_dir: Optional[str] = None,
+                 resume_state: Optional[dict] = None):
         """
         Initialize PSO optimizer.
         
@@ -73,10 +79,15 @@ class ParticleSwarmOptimizer:
             convergence_patience: Iterations without improvement before stopping
             seed: Random seed
             logger: Optional logger for progress tracking
+            checkpoint_interval: Save checkpoint every N iterations
+            temp_dir: Directory for checkpoint files
+            resume_state: Previous optimizer state to resume from
         """
         self.objective_function = objective_function
         self.n_particles = n_particles
         self.n_iterations = n_iterations
+        self.checkpoint_interval = checkpoint_interval
+        self.temp_dir = Path(temp_dir) if temp_dir else None
         
         # PSO parameters
         self.w = w
@@ -98,27 +109,43 @@ class ParticleSwarmOptimizer:
         # Logger
         self.logger = logger
         
-        # Bounds
+        # Bounds (active params only)
         self.lower, self.upper = get_bounds_arrays()
+        self.n_dims = get_active_n_params()
         self.range = self.upper - self.lower
         self.v_max = v_max_factor * self.range
         
-        # Swarm state
-        self.particles = None
-        self.velocities = None
-        self.pbest = None
-        self.pbest_obj = None
-        self.gbest = None
-        self.gbest_obj = None
-        
-        # History
-        self.gbest_history = []
-        self.diversity_history = []
+        # Resume from checkpoint or initialize fresh
+        if resume_state:
+            self.particles = resume_state.get('particles')
+            self.velocities = resume_state.get('velocities')
+            self.pbest = resume_state.get('pbest')
+            self.pbest_obj = resume_state.get('pbest_obj')
+            self.gbest = resume_state.get('gbest')
+            self.gbest_obj = resume_state.get('gbest_obj', np.inf)
+            self.gbest_history = resume_state.get('gbest_history', [])
+            self.diversity_history = resume_state.get('diversity_history', [])
+            self.start_iteration = resume_state.get('iteration_count', 0)
+            self._log(f"  ✅ Resumed from iteration {self.start_iteration}")
+        else:
+            # Swarm state
+            self.particles = None
+            self.velocities = None
+            self.pbest = None
+            self.pbest_obj = None
+            self.gbest = None
+            self.gbest_obj = None
+            
+            # History
+            self.gbest_history = []
+            self.diversity_history = []
+            self.start_iteration = 0
         
         self._log("PSO Optimizer initialized")
         self._log(f"  Particles: {n_particles}")
         self._log(f"  Iterations: {n_iterations}")
         self._log(f"  w: {w}, c1: {c1}, c2: {c2}")
+        self._log(f"  Checkpoint interval: {checkpoint_interval}")
     
     def _log(self, message: str):
         """Log message."""
@@ -134,13 +161,13 @@ class ParticleSwarmOptimizer:
         # Random positions within bounds
         self.particles = np.random.uniform(
             self.lower, self.upper, 
-            size=(self.n_particles, N_PARAMS)
+            size=(self.n_particles, self.n_dims)
         )
         
         # Random velocities (small initial velocities)
         self.velocities = np.random.uniform(
             -self.v_max * 0.1, self.v_max * 0.1,
-            size=(self.n_particles, N_PARAMS)
+            size=(self.n_particles, self.n_dims)
         )
         
         # Initialize personal bests
@@ -187,8 +214,8 @@ class ParticleSwarmOptimizer:
         w_current = self.w_max - (self.w_max - self.w_min) * iteration / self.n_iterations
         
         # Random factors
-        r1 = np.random.uniform(0, 1, size=(self.n_particles, N_PARAMS))
-        r2 = np.random.uniform(0, 1, size=(self.n_particles, N_PARAMS))
+        r1 = np.random.uniform(0, 1, size=(self.n_particles, self.n_dims))
+        r2 = np.random.uniform(0, 1, size=(self.n_particles, self.n_dims))
         
         # Velocity update
         cognitive = self.c1 * r1 * (self.pbest - self.particles)
@@ -246,20 +273,26 @@ class ParticleSwarmOptimizer:
         self._log("Starting PSO Optimization")
         self._log("="*80)
         
-        # Initialize
-        self.initialize_swarm()
-        
-        # Initial evaluation
-        self.evaluate_swarm()
-        self.gbest_history.append(self.gbest_obj)
-        self.diversity_history.append(self.compute_diversity())
-        
-        self._log(f"Initial best objective: {self.gbest_obj:.6f}")
+        # Initialize only if not resuming
+        if self.start_iteration == 0:
+            self.initialize_swarm()
+            
+            # Initial evaluation
+            self.evaluate_swarm()
+            self.gbest_history.append(self.gbest_obj)
+            self.diversity_history.append(self.compute_diversity())
+            
+            self._log(f"Initial best objective: {self.gbest_obj:.6f}")
+        else:
+            self._log(f"Resuming from iteration {self.start_iteration}")
+            self._log(f"Current best: {self.gbest_obj:.6f}")
         
         # Main loop
         for iteration in range(1, self.n_iterations + 1):
+            total_iteration = self.start_iteration + iteration
+            
             # Update velocities and positions
-            self.update_velocities(iteration)
+            self.update_velocities(total_iteration)
             self.update_positions()
             
             # Evaluate new positions
@@ -272,21 +305,46 @@ class ParticleSwarmOptimizer:
             
             # Log progress
             if iteration % 10 == 0 or iteration == 1:
-                self._log(f"Iteration {iteration}/{self.n_iterations}: "
+                self._log(f"Iteration {total_iteration}/{self.start_iteration + self.n_iterations}: "
                          f"Best = {self.gbest_obj:.6f}, "
                          f"Diversity = {diversity:.6f}")
                 
                 if self.logger:
                     self.logger.log_iteration(
-                        iteration=iteration,
+                        iteration=total_iteration,
                         best_objective=self.gbest_obj,
                         best_params=self.gbest,
                         diversity=diversity
                     )
             
+            # Checkpoint kaydet
+            if self.checkpoint_interval > 0 and total_iteration % self.checkpoint_interval == 0:
+                if self.temp_dir:
+                    checkpoint_path = get_checkpoint_path(self.temp_dir, total_iteration)
+                    optimizer_state = {
+                        'particles': self.particles,
+                        'velocities': self.velocities,
+                        'pbest': self.pbest,
+                        'pbest_obj': self.pbest_obj,
+                        'gbest': self.gbest,
+                        'gbest_obj': self.gbest_obj,
+                        'gbest_history': self.gbest_history,
+                        'diversity_history': self.diversity_history,
+                        'iteration_count': total_iteration
+                    }
+                    save_checkpoint(
+                        filepath=checkpoint_path,
+                        algorithm='pso',
+                        optimizer_state=optimizer_state,
+                        best_params=self.gbest,
+                        best_objective=self.gbest_obj,
+                        iteration_count=total_iteration,
+                        config={'n_particles': self.n_particles, 'n_iterations': self.n_iterations}
+                    )
+            
             # Check convergence
             if self.check_convergence():
-                self._log(f"\nConverged at iteration {iteration}")
+                self._log(f"\nConverged at iteration {total_iteration}")
                 break
         
         # Final results
@@ -307,7 +365,8 @@ class ParticleSwarmOptimizer:
 
 def run_pso(objective_function: Callable,
             config: Optional[Dict] = None,
-            logger: Optional[OptimizationLogger] = None) -> Dict:
+            logger: Optional[OptimizationLogger] = None,
+            resume_state: Optional[dict] = None) -> Dict:
     """
     Run PSO optimization with configuration.
     
@@ -315,6 +374,7 @@ def run_pso(objective_function: Callable,
         objective_function: Function to minimize
         config: Configuration dictionary with PSO parameters
         logger: Optional logger
+        resume_state: Optional state to resume from
         
     Returns:
         Dictionary with results
@@ -332,7 +392,9 @@ def run_pso(objective_function: Callable,
         'boundary_method': 'clip',
         'convergence_threshold': 1e-6,
         'convergence_patience': 10,
-        'seed': None
+        'seed': None,
+        'checkpoint_interval': 50,
+        'temp_dir': None
     }
     
     # Update with user config
@@ -343,6 +405,7 @@ def run_pso(objective_function: Callable,
     pso = ParticleSwarmOptimizer(
         objective_function=objective_function,
         logger=logger,
+        resume_state=resume_state,
         **default_config
     )
     

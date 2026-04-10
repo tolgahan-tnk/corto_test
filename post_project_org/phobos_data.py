@@ -163,11 +163,22 @@ def build_param_grid(n_templates, ranges=None):
 # ============================================================================
 # SPICE HELPER FUNCTIONS
 # ============================================================================
-def get_camera_config():
+def get_camera_config(mission_cfg=None):
     """
-    SPICE'dan kamera konfigürasyonu alır.
-    SPICE yoksa veya başarısız olursa hata fırlatır (NO FALLBACK).
+    Get camera configuration for CORTO scene JSON.
+    
+    If mission_cfg is provided and has camera_config, return it directly.
+    Otherwise fall back to SPICE (HRSC path).
+    
+    Args:
+        mission_cfg: MissionConfig instance (optional). If None, uses SPICE.
     """
+    # ── Mission config path (OSIRIS, generic) ──
+    if mission_cfg is not None and mission_cfg.camera_config is not None:
+        print(f"  📷 Camera config from mission: {mission_cfg.mission_id}")
+        return mission_cfg.camera_config
+    
+    # ── SPICE path (HRSC, original behavior) ──
     if not HAS_SPICE:
         raise RuntimeError(
             "❌ SPICE is required but not available!\n"

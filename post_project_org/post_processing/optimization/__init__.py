@@ -27,6 +27,7 @@ from .optimization_helper import (
 
 from .PSO import ParticleSwarmOptimizer, run_pso
 from .Genetic import GeneticAlgorithm, run_genetic
+from .CMAES import CMAESOptimizer, run_cmaes
 
 __all__ = [
     'PARAMETER_BOUNDS',
@@ -41,5 +42,7 @@ __all__ = [
     'ParticleSwarmOptimizer',
     'run_pso',
     'GeneticAlgorithm',
-    'run_genetic'
+    'run_genetic',
+    'CMAESOptimizer',
+    'run_cmaes'
 ]

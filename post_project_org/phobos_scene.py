@@ -22,6 +22,68 @@ import cortopy as corto
 
 
 # ============================================================================
+# MARS BILIMSEL PARAMETRELER (NASA/IAU/MOLA)
+# ============================================================================
+MARS_MEAN_RADIUS_KM = 3389.5        # IAU 2015 ortalama yarıçap
+MARS_TOTAL_RELIEF_KM = 28.381       # MOLA: Olympus Mons (+21.229) + Hellas (-7.152)
+# Displacement scale: metre → km (Mars_65k_km.obj: 1 BU = 1 km)
+MARS_DISP_SCALE = 0.001
+# Displacement mid_level: OBJ radius (equatorial) vs areoid mean radius offset
+# OBJ vertex radius = 3396.190 km, MOLA areoid mean = 3389.500 km
+# Fark = 6.690 km = 6690 m → mid_level bunu telafi eder:
+#   DEM=0 (areoid): offset = (0 - 6690) × 0.001 = -6.69 km → vertex: 3396.19 - 6.69 = 3389.5 km ✓
+MARS_OBJ_RADIUS_KM = 3396.190       # OBJ dosyasından ölçülen yarıçap (km)
+MARS_DISP_MID_LEVEL = (MARS_OBJ_RADIUS_KM - MARS_MEAN_RADIUS_KM) * 1000.0  # = 6690.0 metre
+# Bump strength (legacy, used when displacement is disabled)
+MARS_SCENE_SCALE = 1000.0           # Blender sahne scale faktörü
+MARS_BUMP_STRENGTH = MARS_TOTAL_RELIEF_KM / (MARS_OBJ_RADIUS_KM * MARS_SCENE_SCALE / 1000.0)
+# ≈ 0.0083568
+
+
+# ============================================================================
+# RENDER QUALITY DEFAULTS
+# Buradaki değerleri doğrudan değiştirerek render kalitesini yönetin.
+# CORTO scene_mmx.json üzerinden set ettiği değerleri burada override ediyoruz.
+# ============================================================================
+
+# Cycles render samples
+# CORTO default: 4  |  Blender default: 128
+# Önerilen: Optimizasyon → 4-16, Final render → 64-256
+RENDER_SAMPLES = 64
+RENDER_PREVIEW_SAMPLES = 4
+
+# Light bounces
+# CORTO default: 0  |  Blender default: 12
+# Önerilen: 1-4 (Mars → Phobos yansıması için en az 1 gerekli)
+DIFFUSE_BOUNCES = 4
+
+# Volume bounces (atmosfer scattering için)
+# CORTO default: YOK  |  Blender default: 0
+# Önerilen: 0 = single-scatter, 1-2 = multi-scatter (daha gerçekçi)
+VOLUME_BOUNCES = 2
+
+# Maximum total bounces
+# CORTO default: YOK  |  Blender default: 12
+# Önerilen: 4-12 (uzay sahnesi için 4 yeterli)
+MAX_BOUNCES = 4
+
+# Glossy bounces (specular yansımalar)
+# CORTO default: YOK  |  Blender default: 4
+# Önerilen: 1-4
+GLOSSY_BOUNCES = 2
+
+# Transmission bounces (saydam malzeme geçişleri)
+# CORTO default: YOK  |  Blender default: 12
+# Önerilen: 0-2 (sahnemizde saydam malzeme yok)
+TRANSMISSION_BOUNCES = 0
+
+# Transparent bounces (alpha transparency)
+# CORTO default: YOK  |  Blender default: 8
+# Önerilen: 4-8
+TRANSPARENT_MAX_BOUNCES = 4
+
+
+# ============================================================================
 # GPU FORCING
 # ============================================================================
 def force_nvidia_gpu():
@@ -110,13 +172,19 @@ def save_raw_16bit_png(image_data, output_path):
 # ============================================================================
 # PHOBOS ADVANCED SHADING
 # ============================================================================
-def build_scene_and_materials(State, body_names):
+def build_scene_and_materials(State, body_names,
+                              use_displacement=True,
+                              use_atmosphere=True,
+                              atm_color_mode='single'):
     """
     Sahne ve gelişmiş Phobos malzemesini oluşturur
     
     Args:
         State: CORTO State object
         body_names: Body dosya adları listesi [phobos.obj, mars.obj, deimos.obj]
+        use_displacement: True = MOLA DEM displacement, False = bump mapping
+        use_atmosphere: True = create volumetric atmosphere sphere
+        atm_color_mode: 'single' or 'rgb' (how color is parameterized)
     
     Returns:
         tuple: (ENV, cam, sun, bodies, mat_nodes, tree)
@@ -148,6 +216,15 @@ def build_scene_and_materials(State, body_names):
         bpy.context.scene.cycles.use_persistent_data = True
     except Exception:
         pass
+
+    # ---- Cycles Experimental + Adaptive Subdivision (Mars true displacement) ----
+    if use_displacement:
+        try:
+            bpy.context.scene.cycles.feature_set = 'EXPERIMENTAL'
+            bpy.context.scene.cycles.dicing_rate = 1.0  # pixel/micropolygon
+            print("  ✅ Cycles Experimental + adaptive subdivision enabled (dicing_rate=1.0)")
+        except Exception as e:
+            print(f"  ⚠️ Adaptive subdivision setup failed: {e}")
 
     # Advanced Phobos material
     phobos_material = corto.Shading.create_new_material('Phobos_Advanced_Hybrid')
@@ -215,36 +292,158 @@ def build_scene_and_materials(State, body_names):
     corto.Shading.load_uv_data(body_1, State, 1)
     corto.Shading.assign_material_to_object(phobos_material, body_1)
 
-    # Standard for Mars/Deimos
+    # ============ MARS HYBRID MATERIAL (Phobos tarzı) ============
     material_2 = corto.Shading.create_new_material('Mars_Standard')
     material_3 = corto.Shading.create_new_material('Deimos_Standard')
-    corto.Shading.create_branch_albedo_mix(material_2, State, 2)
+
+    # --- Mars displacement (CORTO branch — fixed, optimize edilmiyor) ---
+    if use_displacement and 'mars_dem_path' in State.path:
+        displacement_mars = {
+            'scale': MARS_DISP_SCALE,
+            'mid_level': MARS_DISP_MID_LEVEL,
+            'colorspace_name': 'Non-Color'
+        }
+        albedo_mars = {'weight_diffuse': 0.95}
+        settings_mars = {'displacement': displacement_mars, 'albedo': albedo_mars}
+        corto.Shading.create_branch_albedo_and_displacement_mix(
+            material_2, State, settings=settings_mars, id_body=2
+        )
+
+        # --- True displacement: BUMP → BOTH (gerçek vertex displacement) ---
+        material_2.cycles.displacement_method = 'BOTH'
+
+        # --- Subdivision Surface modifier (MONET pattern — adaptive tessellation) ---
+        mars_obj = bpy.data.objects.get(name_2)
+        if mars_obj:
+            # Remove existing subsurf if re-running
+            for mod in mars_obj.modifiers:
+                if mod.type == 'SUBSURF' and mod.name == 'Mars_Adaptive':
+                    mars_obj.modifiers.remove(mod)
+                    break
+            subsurf = mars_obj.modifiers.new('Mars_Adaptive', 'SUBSURF')
+            subsurf.subdivision_type = 'SIMPLE'
+            subsurf.levels = 0       # viewport
+            subsurf.render_levels = 0  # adaptive subdivision controls this
+            print(f"  ✅ Mars true displacement + adaptive subdivision enabled")
+        else:
+            print(f"  ⚠️ Mars object '{name_2}' not found for SUBSURF modifier")
+
+        print(f"  ✅ Mars displacement mapping enabled (scale={MARS_DISP_SCALE})")
+    else:
+        corto.Shading.create_branch_albedo_mix(material_2, State, 2)
+        print("  ℹ️ Mars using albedo + bump mapping (no displacement)")
+
     corto.Shading.create_branch_albedo_mix(material_3, State, 3)
 
-    # Mars material için Oren-Nayar (Diffuse) + albedo çarpanı kurulumu
+    # --- Mars hybrid shader node tree ---
     mars_nodes = material_2.node_tree.nodes
     mars_links = material_2.node_tree.links
-    mars_diffuse = next((n for n in mars_nodes if getattr(n, "bl_idname", "") == 'ShaderNodeBsdfDiffuse'), None)
-    mars_mix_shader = next((n for n in mars_nodes if getattr(n, "bl_idname", "") == 'ShaderNodeMixShader'), None)
+
+    # Find existing nodes from CORTO branch
     mars_texture = next((n for n in mars_nodes if getattr(n, "bl_idname", "") == 'ShaderNodeTexImage'), None)
-    mars_multiplier = None
+    mars_uv = next((n for n in mars_nodes if getattr(n, "bl_idname", "") == 'ShaderNodeUVMap'), None)
+    mars_output = next((n for n in mars_nodes if getattr(n, "bl_idname", "") == 'ShaderNodeOutputMaterial'), None)
 
-    if mars_mix_shader:
-        mars_mix_shader.inputs[0].default_value = 0.0  # Principled katkısını kapat
+    # Remove old CORTO-generated shader links (Diffuse, MixShader, Principled)
+    old_diffuse = next((n for n in mars_nodes if getattr(n, "bl_idname", "") == 'ShaderNodeBsdfDiffuse'), None)
+    old_mix_shader = next((n for n in mars_nodes if getattr(n, "bl_idname", "") == 'ShaderNodeMixShader'), None)
+    old_principled = next((n for n in mars_nodes if getattr(n, "bl_idname", "") == 'ShaderNodeBsdfPrincipled'), None)
+    for old_node in [old_diffuse, old_mix_shader, old_principled]:
+        if old_node:
+            mars_nodes.remove(old_node)
 
-    if mars_diffuse and mars_texture:
-        mars_multiplier = mars_nodes.new('ShaderNodeVectorMath')
-        mars_multiplier.operation = 'MULTIPLY'
-        mars_multiplier.location = (-200, 50)
-        mars_multiplier.inputs[1].default_value = (1.0, 1.0, 1.0)
+    # RGB → BW
+    mars_rgb_to_bw = mars_nodes.new('ShaderNodeRGBToBW')
+    mars_rgb_to_bw.location = (-300, 100)
 
+    # Value node (mars_base_gray)
+    mars_value_node = mars_nodes.new('ShaderNodeValue')
+    mars_value_node.location = (-300, -100)
+    mars_value_node.outputs['Value'].default_value = 0.15
+
+    # MixFloat (mars_tex_mix): texture vs base_gray karışımı
+    mars_mix_value_node = mars_nodes.new('ShaderNodeMix')
+    mars_mix_value_node.data_type = 'FLOAT'
+    mars_mix_value_node.location = (0, 0)
+    mars_mix_value_node.inputs['Factor'].default_value = 0.8
+
+    # Albedo multiplier (VectorMath MULTIPLY)
+    mars_multiplier = mars_nodes.new('ShaderNodeVectorMath')
+    mars_multiplier.operation = 'MULTIPLY'
+    mars_multiplier.location = (200, 100)
+    mars_multiplier.inputs[1].default_value = (1.0, 1.0, 1.0)
+
+    # OrenNayar BSDF
+    mars_oren_node = corto.Shading.diffuse_BSDF(material_2, location=(450, 200))
+    mars_oren_node.inputs['Roughness'].default_value = 0.9
+
+    # Principled BSDF
+    mars_principled_node = corto.Shading.principled_BSDF(material_2, location=(450, -200))
+    mars_principled_node.inputs['Roughness'].default_value = 0.85
+    if 'IOR' in mars_principled_node.inputs:
+        mars_principled_node.inputs['IOR'].default_value = 1.50
+    for spec_name in ('Specular IOR Level', 'Specular'):
+        if spec_name in mars_principled_node.inputs:
+            mars_principled_node.inputs[spec_name].default_value = 0.50
+            break
+    # Dielectric settings
+    for slot in ('Metallic', 'Clearcoat', 'Sheen', 'Coat Weight'):
+        if slot in mars_principled_node.inputs:
+            mars_principled_node.inputs[slot].default_value = 0.0
+
+    # MixShader (mars_shader_mix)
+    mars_mix_shader_node = corto.Shading.mix_node(material_2, location=(700, 0))
+    mars_mix_shader_node.inputs[0].default_value = 0.1
+
+    # --- Link nodes ---
+    # Texture → RGB→BW
+    if mars_texture:
+        mars_links.new(mars_texture.outputs['Color'], mars_rgb_to_bw.inputs['Color'])
+    # RGB→BW → MixFloat.A
+    mars_links.new(mars_rgb_to_bw.outputs['Val'], mars_mix_value_node.inputs['A'])
+    # Value → MixFloat.B
+    mars_links.new(mars_value_node.outputs['Value'], mars_mix_value_node.inputs['B'])
+    # MixFloat → Albedo multiplier
+    mars_links.new(mars_mix_value_node.outputs['Result'], mars_multiplier.inputs[0])
+    # Albedo multiplier → OrenNayar Color + Principled Base Color
+    mars_links.new(mars_multiplier.outputs['Vector'], mars_oren_node.inputs['Color'])
+    mars_links.new(mars_multiplier.outputs['Vector'], mars_principled_node.inputs['Base Color'])
+    # OrenNayar → MixShader.1, Principled → MixShader.2
+    mars_links.new(mars_oren_node.outputs['BSDF'], mars_mix_shader_node.inputs[1])
+    mars_links.new(mars_principled_node.outputs['BSDF'], mars_mix_shader_node.inputs[2])
+    # MixShader → Material Output
+    if mars_output:
+        # Remove old surface link
         for link in list(mars_links):
-            if link.to_node == mars_diffuse and getattr(link.to_socket, 'name', '') == 'Color':
+            if link.to_node == mars_output and getattr(link.to_socket, 'name', '') == 'Surface':
                 mars_links.remove(link)
+        mars_links.new(mars_mix_shader_node.outputs['Shader'], mars_output.inputs['Surface'])
 
-        mars_links.new(mars_texture.outputs['Color'], mars_multiplier.inputs[0])
-        mars_links.new(mars_multiplier.outputs['Vector'], mars_diffuse.inputs['Color'])
-        mars_diffuse.inputs['Roughness'].default_value = 0.5
+    print("  ✅ Mars hybrid shader created (OrenNayar + Principled BSDF)")
+
+    # --- Mars bump mapping (fallback when no displacement) ---
+    if not (use_displacement and 'mars_dem_path' in State.path):
+        if 'mars_bump_path' in State.path:
+            mars_bump_tex = mars_nodes.new('ShaderNodeTexImage')
+            mars_bump_tex.location = (-500, -300)
+            try:
+                mars_bump_tex.image = bpy.data.images.load(State.path['mars_bump_path'])
+                mars_bump_tex.image.colorspace_settings.name = 'Non-Color'
+            except Exception as e:
+                print(f"  ⚠️ Mars bump texture yüklenemedi: {e}")
+
+            mars_bump_node = mars_nodes.new('ShaderNodeBump')
+            mars_bump_node.location = (200, -300)
+            mars_bump_node.inputs['Strength'].default_value = MARS_BUMP_STRENGTH
+            mars_bump_node.inputs['Distance'].default_value = 1.0
+
+            if mars_uv:
+                mars_links.new(mars_uv.outputs['UV'], mars_bump_tex.inputs['Vector'])
+
+            mars_links.new(mars_bump_tex.outputs['Color'], mars_bump_node.inputs['Height'])
+            mars_links.new(mars_bump_node.outputs['Normal'], mars_oren_node.inputs['Normal'])
+            mars_links.new(mars_bump_node.outputs['Normal'], mars_principled_node.inputs['Normal'])
+            print(f"  ✅ Mars 6K bump mapping etkinleştirildi (strength={MARS_BUMP_STRENGTH:.10f})")
 
     corto.Shading.load_uv_data(body_2, State, 2)
     corto.Shading.assign_material_to_object(material_2, body_2)
@@ -267,24 +466,14 @@ def build_scene_and_materials(State, body_names):
         for node in tree.nodes:
             if getattr(node, "bl_idname", "") == "CompositorNodeOutputFile":
                 for slot in node.file_slots:
-                    # Get current path
                     current_path = slot.path
-                    
-                    # Fix Windows backslashes to forward slashes
                     if '\\' in current_path:
                         current_path = current_path.replace('\\', '/')
-                    
-                    # Ensure frame number placeholder exists
                     if '#' not in current_path:
-                        # Add frame numbering if missing
                         if '/' in current_path:
-                            # Has directory, append to end
                             current_path = current_path.rstrip('/') + '/######'
                         else:
-                            # No directory, just numbering
                             current_path = '######'
-                    
-                    # Update the path
                     slot.path = current_path
                     
         print(f" ✅ Compositor paths configured for {platform.system()}")
@@ -292,9 +481,9 @@ def build_scene_and_materials(State, body_names):
     except Exception as e:
         print(f" ⚠️ Warning: compositor path fix failed: {e}")
 
-    # Scales
+    # Scales — Mars_65k_km.obj already in km, no need for 1e3
     body_1.set_scale(np.array([1, 1, 1]))
-    body_2.set_scale(np.array([1e3, 1e3, 1e3]))
+    body_2.set_scale(np.array([1, 1, 1]))
     body_3.set_scale(np.array([1, 1, 1]))
 
     # Pack refs
@@ -304,13 +493,65 @@ def build_scene_and_materials(State, body_names):
         'oren_node': oren_node,
         'principled_node': principled_node,
         'mix_shader_node': mix_shader_node,
+        # Mars hybrid shader nodes
+        'mars_value_node': mars_value_node,
+        'mars_mix_value_node': mars_mix_value_node,
+        'mars_oren_node': mars_oren_node,
+        'mars_principled_node': mars_principled_node,
+        'mars_mix_shader_node': mars_mix_shader_node,
+        'mars_albedo_multiplier': mars_multiplier,
     }
 
-    if mars_diffuse:
-        mat_nodes['mars_diffuse_node'] = mars_diffuse
-    if mars_multiplier:
-        mat_nodes['mars_albedo_multiplier'] = mars_multiplier
+    # ============ ATMOSPHERE ============
+    if use_atmosphere:
+        try:
+            # Import atmosphere helper — CWD is project root (corto_test/)
+            helpers_path = os.path.join(os.getcwd(), 'helpers')
+            if helpers_path not in sys.path:
+                sys.path.insert(0, helpers_path)
+            from atmosphere import create_atmosphere
 
+            # Create atmosphere (default params — will be updated per iteration)
+            atm_obj = create_atmosphere(
+                name='Mars_Atmosphere',
+                center_object=name_2,
+                body_radius=MARS_MEAN_RADIUS_KM,
+                atmosphere_ratio=1.0177,
+                beta0=3e-4,
+                scale_height=11.0,
+                anisotropy=0.6,
+                color=(0.8, 0.5, 0.3),
+            )
+
+            # Store atmosphere node references for optimizer
+            atm_mat = atm_obj.data.materials[0]
+            atm_nodes = atm_mat.node_tree.nodes
+            mat_nodes['atm_volume_node'] = atm_nodes.get('Principled Volume')
+            mat_nodes['atm_beta0_node'] = atm_nodes.get('beta0')
+            mat_nodes['atm_H_node'] = atm_nodes.get('H')
+            mat_nodes['atm_color_mode'] = atm_color_mode
+
+            print("  ✅ Mars atmosphere created (beta0=3e-4, H=11km)")
+        except Exception as e:
+            print(f"  ⚠️ Atmosphere creation failed: {e}")
+            import traceback; traceback.print_exc()
+
+    # ============ RENDER QUALITY OVERRIDES ============
+    # CORTO'nun JSON'dan set ettiği değerleri burada override ediyoruz.
+    # Değerleri değiştirmek için dosya başındaki RENDER_QUALITY_DEFAULTS bölümüne bakın.
+    cycles = bpy.context.scene.cycles
+    cycles.samples = RENDER_SAMPLES
+    cycles.preview_samples = RENDER_PREVIEW_SAMPLES
+    cycles.diffuse_bounces = DIFFUSE_BOUNCES
+    cycles.volume_bounces = VOLUME_BOUNCES
+    cycles.max_bounces = MAX_BOUNCES
+    cycles.glossy_bounces = GLOSSY_BOUNCES
+    cycles.transmission_bounces = TRANSMISSION_BOUNCES
+    cycles.transparent_max_bounces = TRANSPARENT_MAX_BOUNCES
+
+    print(f"  ✅ Render quality: samples={RENDER_SAMPLES}, "
+          f"diffuse={DIFFUSE_BOUNCES}, volume={VOLUME_BOUNCES}, "
+          f"max={MAX_BOUNCES}, glossy={GLOSSY_BOUNCES}")
 
     return ENV, cam, sun, (body_1, body_2, body_3), mat_nodes, tree
 
@@ -353,15 +594,52 @@ def set_phobos_params(mat_nodes, params):
         if slot in mat_nodes['principled_node'].inputs:
             mat_nodes['principled_node'].inputs[slot].default_value = 0.0
 
-    if 'mars_rough' in params and 'mars_diffuse_node' in mat_nodes:
-        mat_nodes['mars_diffuse_node'].inputs['Roughness'].default_value = float(params['mars_rough'])
+
+# ============================================================================
+# MARS PARAMETER APPLICATION
+# ============================================================================
+def set_mars_params(mat_nodes, params):
+    """
+    Mars hybrid shader parametrelerini uygular.
+    OrenNayar + Principled BSDF mix with texture/gray blending.
+    """
+    if 'mars_base_gray' in params and 'mars_value_node' in mat_nodes:
+        mat_nodes['mars_value_node'].outputs['Value'].default_value = float(params['mars_base_gray'])
+
+    if 'mars_tex_mix' in params and 'mars_mix_value_node' in mat_nodes:
+        mat_nodes['mars_mix_value_node'].inputs['Factor'].default_value = float(params['mars_tex_mix'])
+
+    if 'mars_oren_rough' in params and 'mars_oren_node' in mat_nodes:
+        mat_nodes['mars_oren_node'].inputs['Roughness'].default_value = float(params['mars_oren_rough'])
+
+    if 'mars_princ_rough' in params and 'mars_principled_node' in mat_nodes:
+        mat_nodes['mars_principled_node'].inputs['Roughness'].default_value = float(params['mars_princ_rough'])
+
+    if 'mars_ior' in params and 'mars_principled_node' in mat_nodes:
+        if 'IOR' in mat_nodes['mars_principled_node'].inputs:
+            mat_nodes['mars_principled_node'].inputs['IOR'].default_value = float(params['mars_ior'])
+
+    # Specular IOR Level sabit 0.5
+    if 'mars_principled_node' in mat_nodes:
+        for spec_name in ('Specular IOR Level', 'Specular'):
+            if spec_name in mat_nodes['mars_principled_node'].inputs:
+                mat_nodes['mars_principled_node'].inputs[spec_name].default_value = 0.5
+                break
+
+    if 'mars_shader_mix' in params and 'mars_mix_shader_node' in mat_nodes:
+        mat_nodes['mars_mix_shader_node'].inputs[0].default_value = float(params['mars_shader_mix'])
+
+    # Dielectric sabitler
+    if 'mars_principled_node' in mat_nodes:
+        for slot in ('Metallic', 'Clearcoat', 'Sheen', 'Coat Weight'):
+            if slot in mat_nodes['mars_principled_node'].inputs:
+                mat_nodes['mars_principled_node'].inputs[slot].default_value = 0.0
 
     if 'mars_albedo_mul' in params and 'mars_albedo_multiplier' in mat_nodes:
         mul = float(params['mars_albedo_mul'])
         try:
             mat_nodes['mars_albedo_multiplier'].inputs[1].default_value = (mul, mul, mul)
         except Exception:
-            # Fallback for vector inputs with 4 components
             vec = getattr(mat_nodes['mars_albedo_multiplier'].inputs[1], 'default_value', None)
             if vec is not None:
                 try:
@@ -369,15 +647,87 @@ def set_phobos_params(mat_nodes, params):
                 except Exception:
                     mat_nodes['mars_albedo_multiplier'].inputs[1].default_value = (mul, mul, mul, 1.0)
 
+
+# ============================================================================
+# ATMOSPHERE PARAMETER APPLICATION
+# ============================================================================
+def set_atmosphere_params(mat_nodes, params):
+    """
+    Update atmosphere shader node values from optimizer params.
+    
+    Args:
+        mat_nodes: Dictionary of material node references (from build_scene_and_materials)
+        params: Dictionary of parameter values
+    """
+    if 'atm_volume_node' not in mat_nodes or mat_nodes['atm_volume_node'] is None:
+        return
+    
+    vol = mat_nodes['atm_volume_node']  # Principled Volume
+    color_mode = mat_nodes.get('atm_color_mode', 'single')
+    
+    if 'atm_beta0' in params and mat_nodes.get('atm_beta0_node'):
+        mat_nodes['atm_beta0_node'].outputs[0].default_value = float(params['atm_beta0'])
+    
+    if 'atm_scale_height' in params and mat_nodes.get('atm_H_node'):
+        mat_nodes['atm_H_node'].outputs[0].default_value = float(params['atm_scale_height'])
+    
+    if 'atm_anisotropy' in params:
+        vol.inputs['Anisotropy'].default_value = float(params['atm_anisotropy'])
+    
+    # Color: RGB mode or single-channel mode
+    if color_mode == 'rgb' and all(k in params for k in ['atm_color_r', 'atm_color_g', 'atm_color_b']):
+        r = float(params['atm_color_r'])
+        g = float(params['atm_color_g'])
+        b = float(params['atm_color_b'])
+        vol.inputs['Color'].default_value = (r, g, b, 1.0)
+    elif 'atm_color_r' in params:
+        r = float(params['atm_color_r'])
+        # Proportional G/B from Mars dust ratio (0.8, 0.5, 0.3)
+        vol.inputs['Color'].default_value = (r, r * 0.625, r * 0.375, 1.0)
+
+
 # ============================================================================
 # ASSET PATH HELPER
 # ============================================================================
-def add_asset_paths(state):
-    """Input/UV/albedo varlık yollarını State'e ekler"""
+def add_asset_paths(state, dem_path=None, body_names=None):
+    """Input/UV/albedo varlık yollarını State'e ekler
+    
+    Args:
+        state: CORTO State object
+        dem_path: Optional path to Mars DEM TIFF for displacement
+        body_names: Optional list of body OBJ filenames [phobos, mars, deimos].
+                    UV data dosyaları bu isimlerden türetilir (.obj → .json).
+    """
     base = state.path["input_path"]
+    
+    # UV data dosya adlarını body OBJ isimlerinden türet
+    if body_names:
+        phobos_uv = body_names[0].replace('.obj', '.json')
+        deimos_uv = body_names[2].replace('.obj', '.json') if len(body_names) > 2 else 'g_deimos_162m_spc_0000n00000_v001.json'
+    else:
+        # Fallback: phobos_main.py ile uyumlu varsayılan
+        phobos_uv = 'g_phobos_018m_spc_0000n00000_v002.json'
+        deimos_uv = 'g_deimos_162m_spc_0000n00000_v001.json'
+    
     state.add_path('albedo_path_1', os.path.join(base, 'body', 'albedo', 'Phobos grayscale.jpg'))
-    state.add_path('uv_data_path_1', os.path.join(base, 'body', 'uv data', 'g_phobos_018m_spc_0000n00000_v002.json'))
-    state.add_path('albedo_path_2', os.path.join(base, 'body', 'albedo', 'mars_1k_color.jpg'))
+    state.add_path('uv_data_path_1', os.path.join(base, 'body', 'uv data', phobos_uv))
+    state.add_path('albedo_path_2', r'C:\Users\tolga\.gemini\antigravity\scratch\corto_test\input\S07_Mars_Phobos_Deimos\body\albedo\Mars_Viking_MDIM21_ClrMosaic_global_32k_shifted.tif')
     state.add_path('uv_data_path_2', os.path.join(base, 'body', 'uv data', 'Mars_65k.json'))
+    state.add_path('mars_bump_path', os.path.join(base, 'body', 'displacement', 'Mars_MOLA_DEM_f32.tif'))
     state.add_path('albedo_path_3', os.path.join(base, 'body', 'albedo', 'Deimos grayscale.jpg'))
-    state.add_path('uv_data_path_3', os.path.join(base, 'body', 'uv data', 'g_deimos_162m_spc_0000n00000_v001.json'))
+    state.add_path('uv_data_path_3', os.path.join(base, 'body', 'uv data', deimos_uv))
+    
+    # DEM displacement path (configurable)
+    if dem_path:
+        state.add_path('mars_dem_path', dem_path)
+        state.add_path('displacement_path_2', dem_path)
+        print(f"  ✅ Mars DEM path set: {dem_path}")
+    else:
+        # Default DEM location
+        default_dem = os.path.join(base, 'body', 'displacement', 'Mars_MOLA_DEM_f32.tif')
+        if os.path.exists(default_dem):
+            state.add_path('mars_dem_path', default_dem)
+            state.add_path('displacement_path_2', default_dem)
+            print(f"  ✅ Mars DEM found at default path")
+        else:
+            print(f"  ℹ️ No Mars DEM found (checked: {default_dem})")

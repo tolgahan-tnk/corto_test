@@ -200,27 +200,33 @@ def extract_pds_clip_params(pds_path: Path) -> Dict[str, int]:
                 pass
     
     # Extract required keys
-    required = {
-        'SAMPLE_FIRST_PIXEL': None,
-        'LINE_FIRST_PIXEL': None,
-        'LINE_SAMPLES': None,
-        'LINES': None
-    }
+    lines_val = _grab_int(text, 'LINES')
+    samples_val = _grab_int(text, 'LINE_SAMPLES')
     
-    for key in required.keys():
-        val = _grab_int(text, key)
-        if val is None:
-            raise ValueError(
-                f"Required PDS key '{key}' not found in {pds_path.name} or sidecar .LBL"
-            )
-        required[key] = val
+    if lines_val is None or samples_val is None:
+        raise ValueError(
+            f"Required PDS keys 'LINES'/'LINE_SAMPLES' not found in {pds_path.name} or sidecar .LBL"
+        )
     
-    # Convert to 0-based offsets
+    sfp = _grab_int(text, 'SAMPLE_FIRST_PIXEL')
+    lfp = _grab_int(text, 'LINE_FIRST_PIXEL')
+    
+    # Full-frame fallback: missions without FIRST_PIXEL fields (e.g. OSIRIS)
+    if sfp is None or lfp is None:
+        print(f"  ℹ️ No SAMPLE/LINE_FIRST_PIXEL in {pds_path.name} — assuming full-frame")
+        return {
+            'col_off': 0,
+            'row_off': 0,
+            'width': samples_val,
+            'height': lines_val
+        }
+    
+    # Convert to 0-based offsets (HRSC path)
     return {
-        'col_off': max(0, required['SAMPLE_FIRST_PIXEL'] - 1),
-        'row_off': max(0, required['LINE_FIRST_PIXEL'] - 1),
-        'width': required['LINE_SAMPLES'],
-        'height': required['LINES']
+        'col_off': max(0, sfp - 1),
+        'row_off': max(0, lfp - 1),
+        'width': samples_val,
+        'height': lines_val
     }
 
 
