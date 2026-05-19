@@ -19,12 +19,24 @@ corto.Utils.clean_scene()
 scenario_name = "S07_Mars_Phobos_Deimos" # Name of the scenario folder
 scene_name = "scene_mmx.json" # name of the scene input
 geometry_name = "geometry_mmx.json" # name of the geometry input
+kernel_list = [
+    os.path.join("input", scenario_name, "kernels", k)
+    for k in ["naif0012.tls", "de440.bsp"]
+]
+spice_time = "2024-12-10T07:35:03.711"
 body_name = ["g_phobos_287m_spc_0000n00000_v002.obj",
              "Mars_65k.obj",
              "g_deimos_162m_spc_0000n00000_v001.obj"] # name of the body input
 
 # Load inputs and settings into the State object
-State = corto.State(scene = scene_name, geometry = geometry_name, body = body_name, scenario = scenario_name)
+State = corto.State(
+    scene=scene_name,
+    geometry=geometry_name,
+    body=body_name,
+    scenario=scenario_name,
+    spice_time=spice_time,
+    kernels=kernel_list,
+)
 # Add extra inputs 
 State.add_path('albedo_path_1',os.path.join(State.path["input_path"],'body','albedo','Phobos grayscale.jpg'))
 State.add_path('uv_data_path_1',os.path.join(State.path["input_path"],'body','uv data','g_phobos_287m_spc_0000n00000_v002.json'))

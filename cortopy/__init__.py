@@ -18,10 +18,11 @@ __all__ = (
     "Sun",
     "State",
     "Environment",
-    "Rendering"
+    "Rendering",
     "PostPro",
     "Shading",
-    "Compositing"
+    "Compositing",
+    "Spice"
 )
 
 from ._version import __version__
@@ -33,4 +34,6 @@ from ._Environment import Environment
 from ._Rendering import Rendering
 from ._Shading import Shading
 from ._Compositing import Compositing
-from ._Utils import Utils 
+from ._Utils import Utils
+from . import _Spice as Spice
+

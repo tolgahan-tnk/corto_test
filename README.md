@@ -92,8 +92,25 @@ This should allow the installation to complete if all compatibility requirements
 
 6) You should see images and labels generated in an output folder
 
-# How to run your own script 
+# How to run your own script
 To shape your own scenario, you can imitate the ones provided in the tutorials. In case you are happy with one of the scenarios, you can always change the inputs and or the tutorial script. Otherwise, if you want to use this library for a different target, you can also imitate how the tutorials script build on it.
+
+## Using SPICE-based geometry
+`State` can automatically compute poses from SPICE kernels when you provide a UTC time string and a list of kernel paths.
+
+```python
+import cortopy as corto
+
+kernels = ["path/to/naif0012.tls", "path/to/de440.bsp"]
+state = corto.State(
+    scene="scene.json",
+    geometry="geometry.json",
+    body="body.obj",
+    scenario="S07_Mars_Phobos_Deimos",
+    spice_time="2024-12-10T07:35:03.711",
+    kernels=kernels,
+)
+```
 
 # Changelog
 
