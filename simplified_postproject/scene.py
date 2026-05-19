@@ -509,7 +509,7 @@ class SceneManager:
 
     # -- Render Loop ----------------------------------------------------------
 
-    def render_all(self) -> dict[str, list[str]]:
+    def render_all(self, save_blend_per_frame: bool = False) -> dict[str, list[str]]:
         """Render all frames with per-PDS dynamic geometry.
 
         For each PDS image:
@@ -612,6 +612,14 @@ class SceneManager:
                 exposure_ms = float(pds_meta.get("exposure_ms", EXPOSURE_REF_MS))
                 film_exp = exposure_ms / EXPOSURE_REF_MS
             bpy.context.scene.cycles.film_exposure = film_exp
+
+            # Re-assert per frame: corto/compositing can silently flip these
+            # between renders, breaking photometric fidelity (matches tutorial).
+            bpy.context.scene.render.image_settings.file_format = "PNG"
+            bpy.context.scene.render.image_settings.color_depth = "16"
+            bpy.context.scene.render.image_settings.compression = 0
+            bpy.context.scene.view_settings.view_transform = "Raw"
+
             self.last_render_info.append({
                 "frame": pds_path.name,
                 "sun_energy": energy,
@@ -678,6 +686,9 @@ class SceneManager:
             logger.info("    Rendered: %s (solar=%.0f km, energy=%.4f)",
                         img_path, solar_dist_km, energy)
 
+            if save_blend_per_frame:
+                self.save_debug_blend(out, f"frame_{idx:06d}")
+
         return paths
 
     def save_debug_blend(self, output_dir: str | Path, label: str = "debug") -> Path | None:
@@ -696,6 +707,15 @@ class SceneManager:
         out.mkdir(parents=True, exist_ok=True)
         blend_path = out / f"{label}.blend"
         try:
+            # Pack all textures into the .blend so they are embedded
+            # and visible when the file is reopened (no external path dependency).
+            for img in bpy.data.images:
+                if img.source == 'FILE' and not img.packed_file:
+                    try:
+                        img.pack()
+                    except Exception as pack_exc:
+                        logger.debug("Could not pack %s: %s", img.name, pack_exc)
+
             # Use a unique temp name to avoid Blender's "file saved with @"
             # lock that prevents overwriting old-format .blend files.
             import tempfile, shutil

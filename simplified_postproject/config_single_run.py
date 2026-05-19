@@ -103,23 +103,23 @@ USE_ATMOSPHERE = False
 # -- Parameters (24) --------------------------------------------------------
 PARAMS: list[ParamDef] = [
     # Phobos (0-5)
-    ParamDef("base_gray",        "phobos", 0.089, 0.281, 0.185,  True, "base_gray"),
-    ParamDef("tex_mix",          "phobos", 0.0,   1.0,   0.825,  True, "tex_mix"),
-    ParamDef("oren_rough",       "phobos", 0.0,   1.0,   0.954,  True, "oren_rough"),
-    ParamDef("princ_rough",      "phobos", 0.0,   1.0,   0.497,  True, "princ_rough"),
-    ParamDef("shader_mix",       "phobos", 0.0,   1.0,   0.553,  True, "shader_mix"),
-    ParamDef("ior",              "phobos", 1.0,   2.5,   1.331,  True, "ior"),
+    ParamDef("base_gray",        "phobos", 0.092111, 0.092111, 0.092111,  False, "base_gray"),
+    ParamDef("tex_mix",          "phobos", 0.999273,   0.999273,   0.999273,  False, "tex_mix"),
+    ParamDef("oren_rough",       "phobos", 0.566540,   0.566540,   0.566540,  False, "oren_rough"),
+    ParamDef("princ_rough",      "phobos", 0.948496,   0.948496,   0.948496,  False, "princ_rough"),
+    ParamDef("shader_mix",       "phobos", 0.427206,   0.427206,   0.427206,  False, "shader_mix"),
+    ParamDef("ior",              "phobos", 1.011997,   1.011997,   1.011997,  False, "ior"),
     # Mars (6-13)
-    ParamDef("mars_base_gray",   "mars",   0.126, 0.216, 0.171,  True, "base_gray"),
-    ParamDef("mars_tex_mix",     "mars",   0.0,   0.20,  0.056,  True, "tex_mix"),
-    ParamDef("mars_oren_rough",  "mars",   0.0,   1.0,   0.999,  True, "oren_rough"),
-    ParamDef("mars_princ_rough", "mars",   0.0,   1.0,   0.740,  True, "princ_rough"),
-    ParamDef("mars_shader_mix",  "mars",   0.0,   1.0,   0.080,  True, "shader_mix"),
-    ParamDef("mars_ior",         "mars",   1.2,   3.5,   2.383,  True, "ior"),
+    ParamDef("mars_base_gray",   "mars",   0.206732, 0.206732, 0.206732,  False, "base_gray"),
+    ParamDef("mars_tex_mix",     "mars",   0.014412,   0.014412,  0.014412,  False, "tex_mix"),
+    ParamDef("mars_oren_rough",  "mars",   0.876880,   0.876880,   0.876880,  False, "oren_rough"),
+    ParamDef("mars_princ_rough", "mars",   0.725968,   0.725968,   0.725968,  False, "princ_rough"),
+    ParamDef("mars_shader_mix",  "mars",   0.793117,   0.793117,   0.793117,  False, "shader_mix"),
+    ParamDef("mars_ior",         "mars",   3.448357,   3.448357,   3.448357,  False, "ior"),
     ParamDef("mars_albedo_mul",  "mars",   2.60,  2.60,   2.60,  False, "albedo_mul"),
-    ParamDef("mars_contrast",    "mars",   0.0,   0.49,   0.176,  True, "contrast"),
+    ParamDef("mars_contrast",    "mars",   0.314671,   00.314671,   0.314671,  False, "contrast"),
     # Atmosphere (14-19) — optimize field tied to USE_ATMOSPHERE
-    ParamDef("atm_beta0",        "atm",    1e-8,  1e-2,  0.00062, USE_ATMOSPHERE, "beta0"),
+    ParamDef("atm_beta0",        "atm",    0.000620,  0.000620,  0.000620, USE_ATMOSPHERE, "beta0"),
     ParamDef("atm_scale_height", "atm",    0.0, 120.0, 60.06,    USE_ATMOSPHERE, "scale_height"),
     ParamDef("atm_anisotropy",   "atm",   -1.0,   1.0,  -0.183,   USE_ATMOSPHERE, "anisotropy"),
     ParamDef("atm_color_r",      "atm",    0.1,   3.0,   0.746,   USE_ATMOSPHERE, "color_r"),
@@ -130,10 +130,10 @@ PARAMS: list[ParamDef] = [
     # OSIRIS saturates around ss~0.05-0.06; equilibrium is ~0.01-0.02. Bound 0.1
     # keeps the per-coord CMA_std (0.2 x 0.099 ~ 0.02) proportional to x0 so the
     # first generation no longer blows past the uint16 ceiling.
-    ParamDef("sun_scaler_hrsc",  "render", 0.016, 0.50,  0.06,     False, "sun_scaler_hrsc"),
-    ParamDef("sun_scaler_osiris","render", 0.016, 0.50,  0.06,    False, "sun_scaler_osiris"),
-    ParamDef("dc_hrsc",          "render", 0.0,  0.01, 0.000027, False, "dc_hrsc"),
-    ParamDef("dc_osiris",        "render", 0.0,  0.01, 0.000050, False, "dc_osiris"),
+    ParamDef("sun_scaler_hrsc",  "render", 0.00153999, 0.001540,  0.001540,     True, "sun_scaler_hrsc"),
+    ParamDef("sun_scaler_osiris","render", 0.001606, 0.001606,  0.001606,    False, "sun_scaler_osiris"),
+    ParamDef("dc_hrsc",          "render", 0.00073599,  0.00073601, 0.000736, True, "dc_hrsc"),
+    ParamDef("dc_osiris",        "render", 0.000146,  0.000146, 0.000146, False, "dc_osiris"),
 ]
 
 # -- Noise Pipeline ----------------------------------------------------------
@@ -192,7 +192,7 @@ ALGORITHM = "cmaes"
 ALGO_SETTINGS = {
     # 12h budget @ ~96s/eval = 450 evals, n=17 boyut (6 frames)
     # CMA-ES: Hansen 2016 default popsize=4+⌊3·ln(n)⌋=12, sigma0=0.2 (1/5 range)  
-    "cmaes":    {"sigma0": 0.20, "popsize": 14, "maxiter": 45},
+    "cmaes":    {"sigma0": 1e-6, "popsize": 2, "maxiter": 2},
     # PSO: Engelbrecht 2007: swarm ~1.5×n; LDIW (Shi & Eberhart 1999); constriction (Clerc & Kennedy 2002) 
     "pso":      {"n_particles": 18, "maxiter": 30,
                  "w_min": 0.4, "w_max": 0.9, "c1": 2.05, "c2": 2.05},

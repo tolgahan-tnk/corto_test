@@ -176,11 +176,10 @@ def main():
     opt.save_history(LOG_FILE)
     csv_log.close()
 
-    # Re-render with best params so cortopy holds the best state, then save .blend
+    # Re-render with best params and save per-frame .blend files
     logger.info("Final render with best parameters (score=%.6f) ...", best_score)
     scene_mgr.update_all(best_x_full)
-    scene_mgr.render_all()
-    scene_mgr.save_debug_blend("optimization_output", "best_final")
+    scene_mgr.render_all(save_blend_per_frame=True)
 
     elapsed = time.time() - t0
     logger.info(
