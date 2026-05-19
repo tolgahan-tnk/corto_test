@@ -1,5 +1,5 @@
 """
-# CORTO - cortopy 
+# CORTO - cortopy
 
 https://github.com/MattiaPugliatti/corto
 
@@ -18,7 +18,7 @@ __all__ = (
     "Sun",
     "State",
     "Environment",
-    "Rendering"
+    "Rendering",
     "PostPro",
     "Shading",
     "Compositing"
@@ -33,4 +33,4 @@ from ._Environment import Environment
 from ._Rendering import Rendering
 from ._Shading import Shading
 from ._Compositing import Compositing
-from ._Utils import Utils 
+from ._Utils import Utils
